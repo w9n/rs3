@@ -640,6 +640,30 @@ pub struct V2ReplayCommit {
     pub(crate) retained_sections: Vec<Option<Bytes>>,
 }
 
+impl V2ReplayCommit {
+    /// Drops replay buffers once their namespace and history have been consumed.
+    pub(super) fn clear_retained_sections(&mut self) {
+        self.retained_sections
+            .iter_mut()
+            .for_each(|section| *section = None);
+    }
+
+    pub(super) fn header_facts(&self) -> Self {
+        let mut facts = self.clone();
+        facts.clear_retained_sections();
+        facts
+    }
+}
+
+pub(super) fn metadata_section_buffer_bytes(length: u64, read_chunk: u64) -> V2Result<u64> {
+    if read_chunk == 0 {
+        return Err(V2FormatError::ReplayBudgetExceeded);
+    }
+    length
+        .checked_add(length.min(read_chunk))
+        .ok_or(V2FormatError::MaintenanceBudgetExceeded)
+}
+
 /// Resource-bounded verified chain used by startup and recovery workflows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V2ReplayChain {
@@ -1244,6 +1268,16 @@ where
         anchor_state: &V2AnchorState,
         limits: V2ReplayLimits,
     ) -> V2Result<V2ReplayChain> {
+        self.load_replay_chain_with_pending_limit(anchor_state, limits, u64::MAX)
+            .await
+    }
+
+    pub(super) async fn load_replay_chain_with_pending_limit(
+        &self,
+        anchor_state: &V2AnchorState,
+        limits: V2ReplayLimits,
+        pending_limit: u64,
+    ) -> V2Result<V2ReplayChain> {
         if limits.max_commits == 0
             || limits.max_total_commit_bytes == 0
             || limits.max_retained_bytes == 0
@@ -1309,6 +1343,7 @@ where
                     &parsed_header,
                     &mut retained_bytes,
                     limits,
+                    pending_limit,
                 )
                 .await?;
             let is_root = parsed_header.header.kind == V2CommitKind::Root;
@@ -1359,6 +1394,7 @@ where
         parsed_header: &V2ParsedCommitHeader,
         retained_bytes: &mut u64,
         limits: V2ReplayLimits,
+        pending_limit: u64,
     ) -> V2Result<Vec<Option<Bytes>>> {
         let sections_start = u64::try_from(parsed_header.sections_start)
             .map_err(|_| V2FormatError::SectionBounds)?;
@@ -1381,6 +1417,12 @@ where
                 .checked_add(section.length)
                 .filter(|total| *total <= limits.max_retained_bytes)
                 .ok_or(V2FormatError::ReplayBudgetExceeded)?;
+            if retained_bytes
+                .checked_add(section.length.min(limits.read_chunk_bytes))
+                .is_none_or(|bytes| bytes > pending_limit)
+            {
+                return Err(V2FormatError::MaintenanceBudgetExceeded);
+            }
             let capacity =
                 usize::try_from(section.length).map_err(|_| V2FormatError::ReplayBudgetExceeded)?;
             let mut retained = Vec::with_capacity(capacity);
@@ -1477,6 +1519,110 @@ where
         Ok(())
     }
 
+    /// Exact immutable facts without downloading unrelated metadata sections.
+    pub(super) async fn read_commit_facts_at(
+        &self,
+        object_id: &BackendObjectId,
+        version_id: Option<&BackendVersionId>,
+    ) -> V2Result<V2ReplayCommit> {
+        let limits = self.options.replay_limits;
+        if limits.max_commits == 0
+            || limits.max_total_commit_bytes == 0
+            || limits.max_retained_bytes == 0
+            || limits.read_chunk_bytes == 0
+        {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+        let metadata = self
+            .store
+            .head_at(object_id, version_id)
+            .await
+            .map_err(|_| V2FormatError::StorageOperationFailed)?;
+        if metadata.content_len > limits.max_total_commit_bytes {
+            return Err(V2FormatError::ReplayBudgetExceeded);
+        }
+        if metadata.object_id != *object_id
+            || version_id.is_some() && metadata.version_id.as_ref() != version_id
+        {
+            return Err(V2FormatError::ProviderProfileFailed);
+        }
+        let parsed_header = self.read_commit_header_at(object_id, version_id).await?;
+        validate_v2_commit_object_len(&parsed_header, metadata.content_len)?;
+        let retained_sections = vec![None; parsed_header.header.section_index.len()];
+        Ok(V2ReplayCommit {
+            parsed_header,
+            version_id: version_id.cloned(),
+            object_len: metadata.content_len,
+            retained_sections,
+        })
+    }
+
+    /// Verifies one required metadata range, checking its bound before the read.
+    pub(super) async fn read_metadata_section(
+        &self,
+        commit: &V2ReplayCommit,
+        ordinal: u32,
+        pending_limit: u64,
+    ) -> V2Result<Bytes> {
+        let descriptor = commit
+            .parsed_header
+            .header
+            .section_index
+            .get(ordinal as usize)
+            .ok_or(V2FormatError::SectionBounds)?;
+        let format_limit = match descriptor.section_type {
+            V2SectionType::IndexRun => super::index_run::V2_INDEX_RUN_MAX_OBJECT_BYTES,
+            V2SectionType::IndexRoot => super::index_root::V2_INDEX_ROOT_MAX_BYTES,
+            V2SectionType::Recovery => super::recovery::section::MAX_RECOVERY_SECTION_BYTES,
+            _ => return Err(V2FormatError::UnsupportedSection),
+        };
+        let chunk = self.options.replay_limits.read_chunk_bytes;
+        if descriptor.section_type == V2SectionType::Recovery
+            && descriptor.length > format_limit as u64
+        {
+            return Err(V2FormatError::RecoveryHistoryCapacity);
+        }
+        if metadata_section_buffer_bytes(descriptor.length, chunk)? > pending_limit
+            || descriptor.length > format_limit as u64
+        {
+            return Err(V2FormatError::MaintenanceBudgetExceeded);
+        }
+        let mut offset = (commit.parsed_header.sections_start as u64)
+            .checked_add(descriptor.offset)
+            .ok_or(V2FormatError::SectionBounds)?;
+        let mut remaining = descriptor.length;
+        let capacity = usize::try_from(remaining).map_err(|_| V2FormatError::SectionBounds)?;
+        let mut stored = Vec::with_capacity(capacity);
+        let mut digest = Sha256Hasher::new();
+        while remaining > 0 {
+            let length = remaining.min(chunk);
+            let bytes = self
+                .read_commit_range_at(
+                    &commit.parsed_header.header.self_ref.commit_key,
+                    commit.version_id.as_ref(),
+                    ByteRange::Slice {
+                        offset,
+                        len: length,
+                    },
+                )
+                .await?;
+            if bytes.len() as u64 != length {
+                return Err(V2FormatError::TruncatedBody);
+            }
+            digest.update(&bytes);
+            stored.extend_from_slice(&bytes);
+            offset = offset
+                .checked_add(length)
+                .ok_or(V2FormatError::SectionBounds)?;
+            remaining -= length;
+        }
+        let actual: [u8; 32] = digest.finalize();
+        if actual != descriptor.digest {
+            return Err(V2FormatError::SectionDigestMismatch);
+        }
+        Ok(Bytes::from(stored))
+    }
+
     pub(super) async fn read_replay_commit_at(
         &self,
         object_id: &BackendObjectId,
@@ -1508,6 +1654,7 @@ where
                 &parsed_header,
                 &mut retained_bytes,
                 limits,
+                u64::MAX,
             )
             .await?;
         Ok(V2ReplayCommit {

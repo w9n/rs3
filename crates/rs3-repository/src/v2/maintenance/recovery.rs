@@ -46,16 +46,23 @@ impl<S: BlobStore> V2CommitStore<S> {
                 Ok(())
             };
         };
+        let current_publish_time_ms = chain
+            .commits_newest_first
+            .first()
+            .ok_or(V2FormatError::InvalidRecoveryHistory)?
+            .parsed_header
+            .header
+            .publish_time_ms;
+        // Namespace and the authoritative registry are now decoded. Only header
+        // facts are needed by later graph/report consumers.
+        if let Some(chain) = reachability.current_chain.as_mut() {
+            for commit in &mut chain.commits_newest_first {
+                commit.clear_retained_sections();
+            }
+        }
+        reachability.history_pending_bytes = 0;
         reachability.recovery_recoverable_point_count = 1;
-        reachability.recovery_oldest_recoverable_publish_time_ms = Some(
-            chain
-                .commits_newest_first
-                .first()
-                .ok_or(V2FormatError::InvalidRecoveryHistory)?
-                .parsed_header
-                .header
-                .publish_time_ms,
-        );
+        reachability.recovery_oldest_recoverable_publish_time_ms = Some(current_publish_time_ms);
         reachability.recovery_clock_uncertainty_ms = Some(accepted.policy.clock_uncertainty_ms());
         let current_floor = (self.provider_profile()
             == V2ProviderProfile::RetainedVersionObjectLock)
@@ -82,10 +89,6 @@ impl<S: BlobStore> V2CommitStore<S> {
             reachability.history_metadata_bytes = reachability
                 .history_metadata_bytes
                 .checked_add(commit_fact_bytes(commit))
-                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
-            reachability.history_pending_bytes = reachability
-                .history_pending_bytes
-                .checked_add(retained_bytes(commit))
                 .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
         }
         self.check_history_graph_bounds(reachability, budgets)?;
@@ -138,16 +141,12 @@ impl<S: BlobStore> V2CommitStore<S> {
             // Capacity includes the current point's eventual historical walk,
             // including obsolete records still present in its immutable runs.
             // This dry traversal grants no retention or deletion authority.
-            let current = chain
-                .commits_newest_first
-                .first()
-                .ok_or(V2FormatError::InvalidRecoveryHistory)?;
             let point = RecoveryPoint {
                 anchor: reachability
                     .anchor_state
                     .clone()
                     .ok_or(V2FormatError::MissingAnchor)?,
-                publish_time_ms: current.parsed_header.header.publish_time_ms,
+                publish_time_ms: current_publish_time_ms,
                 protected_until_ms: blocks
                     .iter()
                     .map(|block| block.0)
@@ -180,9 +179,36 @@ impl<S: BlobStore> V2CommitStore<S> {
                     if anchor.format_ref != self.options().format_ref {
                         return Err(V2FormatError::InvalidFormatRoot);
                     }
-                    let page = self.read_recovery_page(reference).await?;
-                    self.include_history_page_carrier(reachability, anchor, deadline, budgets)
+                    let carrier = self
+                        .history_commit(
+                            reachability,
+                            &anchor.commit_key,
+                            anchor.version_id.as_ref(),
+                            budgets,
+                        )
                         .await?;
+                    let RecoveryPageLocation::Exact {
+                        section_ordinal, ..
+                    } = &reference.location
+                    else {
+                        return Err(V2FormatError::InvalidRecoveryHistory);
+                    };
+                    let bytes = self
+                        .history_section(reachability, &carrier, *section_ordinal, budgets)
+                        .await?;
+                    let page = self.decode_recovery_page(reference, &carrier, bytes)?;
+                    reachability.include_required_protection(
+                        &anchor.commit_key,
+                        anchor.version_id.as_ref(),
+                        self.retention_policy(),
+                        None,
+                    )?;
+                    mark_history_deadline(
+                        reachability,
+                        &anchor.commit_key,
+                        anchor.version_id.as_ref(),
+                        deadline,
+                    )?;
                     for point in page
                         .points
                         .into_iter()
@@ -240,6 +266,33 @@ impl<S: BlobStore> V2CommitStore<S> {
         Ok(())
     }
 
+    async fn history_section(
+        &self,
+        state: &mut V2ReachabilityState,
+        commit: &V2ReplayCommit,
+        ordinal: u32,
+        budgets: V2MaintenanceBudgets,
+    ) -> V2Result<Bytes> {
+        let length = commit
+            .parsed_header
+            .header
+            .section_index
+            .get(ordinal as usize)
+            .ok_or(V2FormatError::SectionBounds)?
+            .length;
+        let buffer_bytes = super::super::repository::metadata_section_buffer_bytes(
+            length,
+            self.options().replay_limits.read_chunk_bytes,
+        )?;
+        if buffer_bytes > budgets.max_history_pending_bytes {
+            return Err(V2FormatError::MaintenanceBudgetExceeded);
+        }
+        state.history_max_section_bytes = state.history_max_section_bytes.max(length);
+        state.history_peak_pending_bytes = state.history_peak_pending_bytes.max(buffer_bytes);
+        self.read_metadata_section(commit, ordinal, budgets.max_history_pending_bytes)
+            .await
+    }
+
     async fn history_commit(
         &self,
         state: &mut V2ReachabilityState,
@@ -257,7 +310,7 @@ impl<S: BlobStore> V2CommitStore<S> {
         }
         // The decoder independently bounds the one active commit. Cache limits
         // are checked before insertion; completed nodes retain only signed facts.
-        let commit = self.read_replay_commit_at(key, version).await?;
+        let commit = self.read_commit_facts_at(key, version).await?;
         let metadata_bytes = commit_fact_bytes(&commit)
             .checked_add(if state.renewal_targets.contains_key(&exact) {
                 0
@@ -266,11 +319,6 @@ impl<S: BlobStore> V2CommitStore<S> {
             })
             .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
         charge_history_metadata(state, metadata_bytes, budgets)?;
-        state.history_pending_bytes = state
-            .history_pending_bytes
-            .checked_add(retained_bytes(&commit))
-            .filter(|bytes| *bytes <= budgets.max_history_pending_bytes)
-            .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
         state.include_chain(
             &V2ReplayChain {
                 commits_newest_first: vec![commit],
@@ -284,49 +332,6 @@ impl<S: BlobStore> V2CommitStore<S> {
             .get(&exact)
             .cloned()
             .ok_or(V2FormatError::InvalidRecoveryHistory)
-    }
-
-    async fn include_history_page_carrier(
-        &self,
-        state: &mut V2ReachabilityState,
-        anchor: &V2AnchorState,
-        deadline: i64,
-        budgets: V2MaintenanceBudgets,
-    ) -> V2Result<()> {
-        let key = (anchor.commit_key.clone(), anchor.version_id.clone());
-        if let Some(target) = state.renewal_targets.get_mut(&key) {
-            target.required_deadline = target.required_deadline.max(Some(deadline));
-        } else {
-            if usize_to_u64(state.renewal_targets.len()) >= budgets.max_inventory_item_count {
-                return Err(V2FormatError::MaintenanceBudgetExceeded);
-            }
-            charge_history_metadata(state, target_fact_bytes(&key), budgets)?;
-            let exact = self
-                .store()
-                .head_at(&anchor.commit_key, anchor.version_id.as_ref())
-                .await
-                .map_err(|_| V2FormatError::StorageOperationFailed)?;
-            state.graph_head_count = state.graph_head_count.saturating_add(1);
-            if exact.object_id != anchor.commit_key
-                || exact.version_id != anchor.version_id
-                || exact.content_len == 0
-            {
-                return Err(V2FormatError::ProviderProfileFailed);
-            }
-            state.include_renewal_target(
-                anchor.commit_key.clone(),
-                anchor.version_id.clone(),
-                exact.content_len,
-                self.retention_policy(),
-                None,
-                Some(deadline),
-            )?;
-        }
-        state.reachable.insert(anchor.commit_key.clone());
-        state.reachable_versions.insert(key.clone());
-        state.reachable_commit_versions.insert(key.clone());
-        state.protected_versions.insert(key);
-        Ok(())
     }
 
     async fn walk_recovery_point(
@@ -384,10 +389,13 @@ impl<S: BlobStore> V2CommitStore<S> {
                         .await?;
                     }
                     V2SectionType::IndexRoot => {
+                        let stored_root = self
+                            .history_section(state, &commit, ordinal, budgets)
+                            .await?;
                         let root = self.open_index_root_without_replay(
                             &commit,
                             ordinal,
-                            commit_section_bytes(&commit, ordinal as usize)?,
+                            &stored_root,
                             V2ReplayLimits {
                                 max_commits: usize::try_from(budgets.max_inventory_item_count)
                                     .map_err(|_| V2FormatError::MaintenanceBudgetExceeded)?,
@@ -396,6 +404,7 @@ impl<S: BlobStore> V2CommitStore<S> {
                                 ..self.options().replay_limits
                             },
                         )?;
+                        drop(stored_root);
                         for expected in root.runs() {
                             let run = self
                                 .history_commit(
@@ -431,7 +440,6 @@ impl<S: BlobStore> V2CommitStore<S> {
                 }
             }
             if header.kind == V2CommitKind::Root {
-                release_history_sections(state, &key, version.as_ref());
                 break;
             }
             let parent = header
@@ -474,6 +482,9 @@ impl<S: BlobStore> V2CommitStore<S> {
         // Replay one unique run, not one namespace per historical point. This
         // reuses all blind-key, pointer, self-pack and catalog-claim validation.
         let mut run_state = RepositoryState::default();
+        let stored_run = self
+            .history_section(state, commit, ordinal, budgets)
+            .await?;
         let actual = apply_packed_index_run(
             self.keyring(),
             &self.options().repository_id,
@@ -483,13 +494,14 @@ impl<S: BlobStore> V2CommitStore<S> {
                 version_id: commit.version_id.as_ref(),
                 object_len: commit.object_len,
                 section_ordinal: ordinal,
-                stored_run: commit_section_bytes(commit, ordinal as usize)?,
+                stored_run: &stored_run,
                 level: expected.map_or(0, |run| run.level),
                 compaction_generation: expected.map_or(0, |run| run.compaction_generation),
                 provider_profile: self.provider_profile(),
             },
         )
         .map_err(|_| V2FormatError::InvalidIndexRun)?;
+        drop(stored_run);
         if expected.is_some_and(|expected| expected != &actual) {
             return Err(V2FormatError::InvalidIndexRoot);
         }
@@ -572,11 +584,6 @@ impl<S: BlobStore> V2CommitStore<S> {
                 }
             }
         }
-        release_history_sections(
-            state,
-            &commit.parsed_header.header.self_ref.commit_key,
-            commit.version_id.as_ref(),
-        );
         Ok(())
     }
 }
@@ -597,16 +604,6 @@ fn include_recovery_point_facts(
             }),
     );
     Ok(())
-}
-
-fn retained_bytes(commit: &V2ReplayCommit) -> u64 {
-    commit
-        .retained_sections
-        .iter()
-        .flatten()
-        .fold(0_u64, |total, bytes| {
-            total.saturating_add(usize_to_u64(bytes.len()))
-        })
 }
 
 pub(super) fn target_fact_bytes(key: &ExactVersion) -> u64 {
@@ -647,26 +644,6 @@ pub(super) fn charge_history_metadata(
         .filter(|total| *total <= budgets.max_history_metadata_bytes)
         .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
     Ok(())
-}
-
-fn release_history_sections(
-    state: &mut V2ReachabilityState,
-    key: &BackendObjectId,
-    version: Option<&BackendVersionId>,
-) {
-    if let Some(commit) = state
-        .verified_commits
-        .get_mut(&(key.clone(), version.cloned()))
-    {
-        state.history_pending_bytes = state
-            .history_pending_bytes
-            .saturating_sub(retained_bytes(commit));
-        let facts = Arc::make_mut(commit);
-        facts
-            .retained_sections
-            .iter_mut()
-            .for_each(|section| *section = None);
-    }
 }
 
 fn mark_history_deadline(
@@ -742,6 +719,7 @@ pub(in crate::v2) struct RecoveryMarkObservation {
     pub expiry_due: Option<i64>,
     pub accounted_metadata_bytes: u64,
     pub pending_section_bytes: u64,
+    pub peak_pending_section_bytes: u64,
     pub point_count: u64,
     pub oldest_publish_time_ms: Option<i64>,
     pub historical_exact_bytes: u64,
@@ -769,6 +747,7 @@ impl<S: BlobStore> V2CommitStore<S> {
             expiry_due: graph.recovery_expiry_due_ms,
             accounted_metadata_bytes: graph.history_metadata_bytes,
             pending_section_bytes: graph.history_pending_bytes,
+            peak_pending_section_bytes: graph.history_peak_pending_bytes,
             point_count: graph.recovery_recoverable_point_count,
             oldest_publish_time_ms: graph.recovery_oldest_recoverable_publish_time_ms,
             historical_exact_bytes: graph.recovery_historical_exact_bytes,

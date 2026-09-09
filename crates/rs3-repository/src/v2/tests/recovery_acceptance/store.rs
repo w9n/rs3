@@ -59,6 +59,17 @@ impl ControlledDeadlineStore {
         (state.versions.len(), state.stored_bytes)
     }
 
+    /// Audit snapshots bypass the operation-counting wrapper deliberately.
+    pub(super) fn inventory(&self) -> Vec<BlobMetadata> {
+        self.state
+            .lock()
+            .expect("provider state")
+            .versions
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub(super) fn latest_deadline(&self) -> i64 {
         self.state
             .lock()

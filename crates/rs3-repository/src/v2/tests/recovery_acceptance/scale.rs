@@ -6,6 +6,7 @@ use serde_json::json;
 use std::time::Instant;
 
 mod capacity;
+mod inventory;
 
 type ScaleStore = CountingBlobStore<ControlledDeadlineStore>;
 
@@ -171,9 +172,15 @@ fn proc_memory(field: &str) -> Option<u64> {
         .checked_mul(1024)
 }
 
-async fn run(mode: &'static str, writes: usize, diagnose: bool) {
+async fn run(mode: &'static str, writes: usize, budgets: V2MaintenanceBudgets) {
     assert!((4..=1_000_000).contains(&writes));
-    let mut scale = Scale::new(mode).await;
+    let mut scale = Scale::with_budgets(mode, budgets).await;
+    println!(
+        "HISTORY_SCALE {}",
+        json!({"phase":"configuration", "mode":mode,
+        "writes":writes, "history_metadata_budget_bytes":budgets.max_history_metadata_bytes,
+        "history_pending_budget_bytes":budgets.max_history_pending_bytes})
+    );
     let coordinator = scale.coordinator();
     let mut samples = Vec::new();
     let mut since = Instant::now();
@@ -224,6 +231,7 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
         .record("delete_checkpoint", writes, since, &before, "ok")
         .await;
 
+    scale.record_inventory("before_reopen").await;
     let since = Instant::now();
     let before = scale.counts();
     scale.restart().await;
@@ -239,7 +247,7 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
     let graph = scale
         .repository
         .commit_store()
-        .recovery_mark_for_tests(&scale.anchor, V2MaintenanceBudgets::default())
+        .recovery_mark_for_tests(&scale.anchor, budgets)
         .await;
     scale
         .record(
@@ -250,83 +258,14 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
             if graph.is_ok() { "ok" } else { "failed" },
         )
         .await;
-    if graph.is_err() && diagnose {
-        let since = Instant::now();
-        let before = scale.counts();
-        let expanded = scale
-            .repository
-            .commit_store()
-            .recovery_mark_for_tests(
-                &scale.anchor,
-                V2MaintenanceBudgets {
-                    max_history_metadata_bytes: 512 * 1024 * 1024,
-                    ..V2MaintenanceBudgets::default()
-                },
-            )
-            .await;
-        scale
-            .record(
-                "diagnostic_metadata_512mib",
-                writes,
-                since,
-                &before,
-                if expanded.is_ok() { "ok" } else { "failed" },
-            )
-            .await;
-        if let Ok(expanded) = expanded {
-            println!(
-                "HISTORY_SCALE {}",
-                json!({"phase":"diagnostic_graph_size", "mode":mode,
-                "points":expanded.point_count, "targets":expanded.targets.len(),
-                "accounted_metadata_bytes":expanded.accounted_metadata_bytes,
-                "final_pending_section_bytes":expanded.pending_section_bytes})
-            );
-        }
-        // A read-only diagnostic budget must not alter the real writer's budget.
-        let since = Instant::now();
-        let before = scale.counts();
-        let accepted = must_v2(scale.anchor.read_v2().await);
-        let coordinator = scale.coordinator();
-        let publication = coordinator
-            .put_committed(
-                must_type(LogicalPath::new("scale/diagnostic-probe")),
-                Bytes::from_static(b"probe"),
-                RepositoryPutOptions::default(),
-            )
-            .await;
-        scale
-            .record(
-                "restart_publication_default_budget",
-                writes,
-                since,
-                &before,
-                if publication.is_err() {
-                    "refused"
-                } else {
-                    "accepted"
-                },
-            )
-            .await;
-        assert!(
-            publication.is_err(),
-            "unqualified coverage must refuse publication"
-        );
-        assert_eq!(must_v2(scale.anchor.read_v2().await), accepted);
-        assert_eq!(
-            scale.counts().put,
-            before.put,
-            "refusal before backend publication"
-        );
-        drop(coordinator);
-    }
-    // Preserve failure under the default budget even if the diagnostic succeeded.
     let graph = must_v2(graph);
     println!(
         "HISTORY_SCALE {}",
         json!({"phase":"graph_size", "mode":mode,
         "points":graph.point_count, "targets":graph.targets.len(),
         "accounted_metadata_bytes":graph.accounted_metadata_bytes,
-        "final_pending_section_bytes":graph.pending_section_bytes})
+        "final_pending_section_bytes":graph.pending_section_bytes,
+        "peak_pending_section_bytes":graph.peak_pending_section_bytes})
     );
     drop(graph);
 
@@ -335,7 +274,13 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
     let report = scale
         .repository
         .commit_store()
-        .quick_maintenance(&scale.anchor)
+        .quick_maintenance_with_options(
+            &scale.anchor,
+            crate::v2::V2QuickMaintenanceOptions {
+                budgets,
+                ..Default::default()
+            },
+        )
         .await;
     scale
         .record(
@@ -362,7 +307,13 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
     let plan = scale
         .repository
         .commit_store()
-        .full_gc_dry_run(&scale.anchor, V2FullGcDryRunOptions::default())
+        .full_gc_dry_run(
+            &scale.anchor,
+            V2FullGcDryRunOptions {
+                budgets,
+                ..Default::default()
+            },
+        )
         .await;
     scale
         .record(
@@ -385,7 +336,7 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
         .apply_full_gc(
             &scale.anchor,
             &UnenforcedQuiescedMaintenanceGuard,
-            apply_options(false),
+            capacity::options(budgets, false),
         )
         .await;
     scale
@@ -418,7 +369,7 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
             .apply_full_gc(
                 &scale.anchor,
                 &UnenforcedQuiescedMaintenanceGuard,
-                apply_options(false),
+                capacity::options(budgets, false),
             )
             .await,
     );
@@ -447,7 +398,7 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
         .apply_full_gc(
             &scale.anchor,
             &UnenforcedQuiescedMaintenanceGuard,
-            apply_options(true),
+            capacity::options(budgets, true),
         )
         .await;
     scale
@@ -479,7 +430,7 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
             .apply_full_gc(
                 &scale.anchor,
                 &UnenforcedQuiescedMaintenanceGuard,
-                apply_options(false),
+                capacity::options(budgets, false),
             )
             .await,
     );
@@ -496,7 +447,7 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
         .apply_full_gc(
             &scale.anchor,
             &UnenforcedQuiescedMaintenanceGuard,
-            apply_options(true),
+            capacity::options(budgets, true),
         )
         .await;
     scale
@@ -530,13 +481,20 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
         scale
             .repository
             .commit_store()
-            .quick_maintenance(&scale.anchor)
+            .quick_maintenance_with_options(
+                &scale.anchor,
+                crate::v2::V2QuickMaintenanceOptions {
+                    budgets,
+                    ..Default::default()
+                },
+            )
             .await,
     );
     assert!(quick.recovery_recoverable_point_count < report.recovery_recoverable_point_count);
     scale
         .record("final_reopen_verify", writes, since, &before, "ok")
         .await;
+    scale.record_inventory("after_gc").await;
     println!(
         "HISTORY_SCALE {}",
         json!({"phase":"complete", "mode":mode, "writes":writes,
@@ -546,12 +504,12 @@ async fn run(mode: &'static str, writes: usize, diagnose: bool) {
 
 #[tokio::test]
 async fn recovery_scale_smoke_overwrite() {
-    run("overwrite", 40, false).await;
+    run("overwrite", 40, V2MaintenanceBudgets::default()).await;
 }
 
 #[tokio::test]
 async fn recovery_scale_smoke_append() {
-    run("append", 40, false).await;
+    run("append", 40, V2MaintenanceBudgets::default()).await;
 }
 
 /// RS3_HISTORY_SCALE_WRITES=10000 RS3_HISTORY_SCALE_MODE=overwrite cargo test
@@ -571,6 +529,12 @@ async fn recovery_history_scale() {
         "overwrite" => "overwrite",
         _ => panic!("append or overwrite"),
     };
-    let diagnose = std::env::var("RS3_HISTORY_SCALE_DIAGNOSE").is_ok_and(|value| value == "1");
-    run(mode, writes, diagnose).await;
+    let mut budgets = V2MaintenanceBudgets::default();
+    if let Ok(value) = std::env::var("RS3_HISTORY_SCALE_METADATA_BYTES") {
+        budgets.max_history_metadata_bytes = value.parse().expect("integer metadata budget");
+    }
+    if let Ok(value) = std::env::var("RS3_HISTORY_SCALE_PENDING_BYTES") {
+        budgets.max_history_pending_bytes = value.parse().expect("integer pending budget");
+    }
+    run(mode, writes, budgets).await;
 }

@@ -3,7 +3,9 @@
 //! A small immutable certificate covers a conservative closure of the accepted
 //! graph. Candidate additions are charged without rereading that graph. At a
 //! boundary (or after cache loss), the exact candidate is walked before CAS.
-//! This does not certify pending-section peaks, inventory or optional I/O caps.
+//! Encoded pending buffers have a separate phase bound: current replay plus one
+//! catalog run, then one historical section. Inventory and optional I/O caps
+//! remain independent; decoder working state has its own format bounds.
 
 use super::*;
 use crate::v2::commit::V2ParsedCommitHeader;
@@ -19,21 +21,43 @@ pub(in crate::v2) struct RecoveryCapacity {
     budgets: V2MaintenanceBudgets,
     metadata_bytes: u64,
     targets: u64,
+    current_replay_bytes: u64,
+    current_max_section_bytes: u64,
+    read_chunk_bytes: u64,
+    catalog_max_run_bytes: u64,
+    history_max_section_bytes: u64,
 }
 
 impl RecoveryCapacity {
     fn fits(&self) -> bool {
         self.metadata_bytes <= self.budgets.max_history_metadata_bytes
             && self.targets <= self.budgets.max_inventory_item_count
+            && self
+                .pending_bytes()
+                .is_some_and(|bytes| bytes <= self.budgets.max_history_pending_bytes)
+    }
+
+    fn pending_bytes(&self) -> Option<u64> {
+        let section = |length| {
+            super::super::repository::metadata_section_buffer_bytes(length, self.read_chunk_bytes)
+                .ok()
+        };
+        let current = self.current_replay_bytes.checked_add(
+            section(self.catalog_max_run_bytes)?
+                .max(self.current_max_section_bytes.min(self.read_chunk_bytes)),
+        )?;
+        Some(current.max(section(self.history_max_section_bytes)?))
     }
 
     fn fits_publication(&self, kind: V2CommitKind) -> bool {
         if kind == V2CommitKind::Root {
             return self.fits();
         }
-        self.metadata_bytes
-            .checked_add(EXPIRY_ROOT_METADATA_RESERVE)
-            .is_some_and(|bytes| bytes <= self.budgets.max_history_metadata_bytes)
+        self.fits()
+            && self
+                .metadata_bytes
+                .checked_add(EXPIRY_ROOT_METADATA_RESERVE)
+                .is_some_and(|bytes| bytes <= self.budgets.max_history_metadata_bytes)
             && self.targets < self.budgets.max_inventory_item_count
     }
 
@@ -63,6 +87,31 @@ impl RecoveryCapacity {
         entries: &[&NamespaceEntry],
         new_runs: &[V2IndexRootRunRef],
     ) -> Option<Self> {
+        let mut replay_bytes = 0_u64;
+        let mut max_section = 0_u64;
+        for section in &header.header.section_index {
+            if matches!(
+                section.section_type,
+                V2SectionType::IndexRun | V2SectionType::IndexRoot | V2SectionType::Recovery
+            ) {
+                replay_bytes = replay_bytes.checked_add(section.length)?;
+                max_section = max_section.max(section.length);
+                self.history_max_section_bytes = self.history_max_section_bytes.max(section.length);
+            }
+            if section.section_type == V2SectionType::IndexRun {
+                self.catalog_max_run_bytes = self.catalog_max_run_bytes.max(section.length);
+            }
+        }
+        self.current_max_section_bytes = if header.header.kind == V2CommitKind::Root {
+            max_section
+        } else {
+            self.current_max_section_bytes.max(max_section)
+        };
+        self.current_replay_bytes = if header.header.kind == V2CommitKind::Root {
+            replay_bytes
+        } else {
+            self.current_replay_bytes.checked_add(replay_bytes)?
+        };
         let runs = header
             .header
             .section_index
@@ -76,6 +125,9 @@ impl RecoveryCapacity {
             usize_to_u64(runs),
         )?;
         for run in new_runs {
+            self.catalog_max_run_bytes = self.catalog_max_run_bytes.max(run.location.section_len);
+            self.history_max_section_bytes =
+                self.history_max_section_bytes.max(run.location.section_len);
             // The complete header span bounds its CBOR header length. Duplicate
             // carrier references may overcount; only a full walk releases credit.
             self.commit(
@@ -173,6 +225,11 @@ impl<S: BlobStore> V2CommitStore<S> {
             budgets,
             metadata_bytes: graph.history_metadata_bytes,
             targets: usize_to_u64(graph.renewal_targets.len()),
+            current_replay_bytes: graph.chain_retained_bytes,
+            current_max_section_bytes: graph.current_max_section_bytes,
+            read_chunk_bytes: self.options().replay_limits.read_chunk_bytes,
+            catalog_max_run_bytes: graph.current_catalog_max_run_bytes,
+            history_max_section_bytes: graph.history_max_section_bytes,
         };
         // Current standalone facts are seeded before the historical walker.
         // Reserve their promotion charge even if some were already historical.

@@ -7,6 +7,7 @@ mod publication_overlap;
 mod publication_time;
 mod recovery_acceptance;
 mod recovery_coverage;
+mod recovery_pending;
 mod recovery_protection;
 mod recovery_publication;
 mod recovery_reachability;

@@ -1,7 +1,7 @@
 //! Admission boundary tests use the same small budgets before and after restart.
 use super::*;
 
-fn options(budgets: V2MaintenanceBudgets, reclaim: bool) -> V2FullGcApplyOptions {
+pub(super) fn options(budgets: V2MaintenanceBudgets, reclaim: bool) -> V2FullGcApplyOptions {
     let mut options = apply_options(reclaim);
     options.dry_run.budgets = budgets;
     options
@@ -371,4 +371,80 @@ async fn recovery_capacity_guard_loss_during_candidate_walk_never_installs_credi
             .is_some()
     );
     check_graph(&scale, V2MaintenanceBudgets::default()).await;
+}
+
+#[tokio::test]
+async fn recovery_capacity_pending_ceiling_survives_restart_and_compaction_releases_replay_credit()
+{
+    let budgets = V2MaintenanceBudgets {
+        max_history_pending_bytes: 16 * 1024,
+        ..V2MaintenanceBudgets::default()
+    };
+    let mut scale = Scale::with_budgets("overwrite", budgets).await;
+    // A long encrypted path makes delta replay larger than its compact catalog
+    // reference, so a checkpoint can demonstrably release pending credit.
+    let key = must_type(LogicalPath::new(format!("capacity/{}", "p".repeat(512))));
+    let body = Bytes::from_static(b"original bytes remain readable");
+    let coordinator = scale.coordinator();
+    let mut last = None;
+    let mut refused = false;
+    for index in 0..64 {
+        scale.advance(scale.start + index * 10);
+        let before = must_v2(scale.anchor.read_v2().await);
+        match coordinator
+            .put_committed(key.clone(), body.clone(), RepositoryPutOptions::default())
+            .await
+        {
+            Ok(write) => {
+                last = Some(write.anchor_state);
+                check_graph(&scale, budgets).await;
+            }
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("maintenance budget exceeded"),
+                    "{error}"
+                );
+                assert_eq!(must_v2(scale.anchor.read_v2().await), before);
+                assert_eq!(coordinator.pending_item_count_for_tests().await, 0);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused, "pending capacity must refuse bounded growth");
+    let last = last.expect("earlier writes fit");
+    drop(coordinator);
+    scale.restart().await;
+    check_graph(&scale, budgets).await;
+    scale.restore(&last, &key, &body).await;
+    // Compaction removes superseded current records and publishes a smaller
+    // root. Historical points still retain their original exact dependencies.
+    must_repo(
+        scale
+            .repository
+            .compact_packed_index_runs(&scale.anchor, &UnenforcedQuiescedMaintenanceGuard)
+            .await,
+    );
+    let coordinator = scale.coordinator();
+    must_repo(
+        coordinator
+            .put_committed(key.clone(), body.clone(), RepositoryPutOptions::default())
+            .await,
+    );
+    drop(coordinator);
+    let graph = must_v2(
+        scale
+            .repository
+            .commit_store()
+            .recovery_mark_for_tests(&scale.anchor, budgets)
+            .await,
+    );
+    assert_eq!(graph.pending_section_bytes, 0);
+    assert!(graph.peak_pending_section_bytes <= budgets.max_history_pending_bytes);
+    scale.restart().await;
+    assert_eq!(
+        must_repo(scale.repository.get_range(&key, ByteRange::Full).await),
+        body
+    );
+    check_graph(&scale, budgets).await;
 }

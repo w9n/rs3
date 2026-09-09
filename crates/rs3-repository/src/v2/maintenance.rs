@@ -1215,6 +1215,10 @@ struct V2ReachabilityState {
     recovery_clock_uncertainty_ms: Option<u32>,
     history_metadata_bytes: u64,
     history_pending_bytes: u64,
+    history_peak_pending_bytes: u64,
+    current_catalog_max_run_bytes: u64,
+    current_max_section_bytes: u64,
+    history_max_section_bytes: u64,
     verified_commits: BTreeMap<(BackendObjectId, Option<BackendVersionId>), Arc<V2ReplayCommit>>,
     reachable: BTreeSet<BackendObjectId>,
     reachable_versions: BTreeSet<(BackendObjectId, Option<BackendVersionId>)>,
@@ -1257,19 +1261,32 @@ impl V2ReachabilityState {
                     return Err(V2FormatError::InvalidHeaderField);
                 }
             } else {
-                self.verified_commits.insert(key, Arc::new(commit.clone()));
+                self.verified_commits
+                    .insert(key, Arc::new(commit.header_facts()));
             }
             if newly_verified {
                 self.chain_get_count = self.chain_get_count.saturating_add(1);
                 self.chain_read_bytes = self.chain_read_bytes.saturating_add(commit.object_len);
-                self.chain_retained_bytes = commit
+            }
+            // Distinct replay calls can own buffers for the same exact commit.
+            // Account loaded sections even when their header facts were cached.
+            self.chain_retained_bytes = commit
+                .retained_sections
+                .iter()
+                .flatten()
+                .try_fold(self.chain_retained_bytes, |total, section| {
+                    total.checked_add(usize_to_u64(section.len()))
+                })
+                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?;
+            self.current_max_section_bytes = self.current_max_section_bytes.max(
+                commit
                     .retained_sections
                     .iter()
                     .flatten()
-                    .fold(self.chain_retained_bytes, |total, section| {
-                        total.saturating_add(usize_to_u64(section.len()))
-                    });
-            }
+                    .map(|section| usize_to_u64(section.len()))
+                    .max()
+                    .unwrap_or(0),
+            );
             let object_id = commit.parsed_header.header.self_ref.commit_key.clone();
             let version_key = (object_id.clone(), commit.version_id.clone());
             self.reachable.insert(object_id.clone());
@@ -1491,7 +1508,7 @@ where
         for expected in ordered_runs {
             let location = &expected.location;
             let replay = self
-                .read_replay_commit_at(&location.commit_key, location.version_id.as_ref())
+                .read_commit_facts_at(&location.commit_key, location.version_id.as_ref())
                 .await?;
             let referenced_header = &replay.parsed_header.header;
             let descriptor_index = usize::try_from(location.section_ordinal)
@@ -1534,7 +1551,9 @@ where
             {
                 return Err(V2FormatError::InvalidIndexRoot);
             }
-            let stored_run = commit_section_bytes(&replay, descriptor_index)?;
+            let stored_run = self
+                .read_metadata_section(&replay, location.section_ordinal, limits.max_retained_bytes)
+                .await?;
             let actual = apply_packed_index_run(
                 self.keyring(),
                 &self.options().repository_id,
@@ -1544,7 +1563,7 @@ where
                     version_id: replay.version_id.as_ref(),
                     object_len: replay.object_len,
                     section_ordinal: location.section_ordinal,
-                    stored_run,
+                    stored_run: &stored_run,
                     level: expected.level,
                     compaction_generation: expected.compaction_generation,
                     provider_profile: self.provider_profile(),
@@ -1969,7 +1988,9 @@ where
         };
 
         if let Some(state) = anchor_state.as_ref() {
-            let chain = self.load_maintenance_chain(state, &reachability).await?;
+            let chain = self
+                .load_maintenance_chain(state, &reachability, budgets)
+                .await?;
             reachability.include_chain(&chain, false, None, None)?;
             let current_state = self
                 .include_live_payload_roots(&mut reachability, &chain, false, budgets)
@@ -1981,7 +2002,7 @@ where
 
         for protected_root in protected_roots {
             let chain = self
-                .load_maintenance_chain(protected_root, &reachability)
+                .load_maintenance_chain(protected_root, &reachability, budgets)
                 .await?;
             reachability.include_chain(&chain, true, None, None)?;
             self.include_live_payload_roots(&mut reachability, &chain, true, budgets)
@@ -2079,6 +2100,7 @@ where
         &self,
         root: &V2AnchorState,
         reachability: &V2ReachabilityState,
+        budgets: V2MaintenanceBudgets,
     ) -> V2Result<V2ReplayChain> {
         let configured = self.options().replay_limits;
         let used_commits = usize::try_from(reachability.chain_get_count)
@@ -2099,7 +2121,7 @@ where
         if max_commits == 0 || max_total_commit_bytes == 0 || max_retained_bytes == 0 {
             return Err(V2FormatError::MaintenanceBudgetExceeded);
         }
-        self.load_replay_chain_from_state_with_limits(
+        self.load_replay_chain_with_pending_limit(
             root,
             V2ReplayLimits {
                 max_commits,
@@ -2107,6 +2129,10 @@ where
                 max_retained_bytes,
                 ..configured
             },
+            budgets
+                .max_history_pending_bytes
+                .checked_sub(reachability.chain_retained_bytes)
+                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?,
         )
         .await
     }
@@ -2118,7 +2144,7 @@ where
         protected: bool,
         budgets: V2MaintenanceBudgets,
     ) -> V2Result<RepositoryState> {
-        let limits = self.remaining_graph_limits(reachability)?;
+        let limits = self.remaining_graph_limits(reachability, budgets)?;
         let (state, live_payload_roots, referenced_run_commits, represented_retention) =
             self.live_payload_roots_from_chain(chain, limits).await?;
         for commit in &chain.commits_newest_first {
@@ -2129,6 +2155,41 @@ where
                 None,
             )?;
         }
+        let current_run_max = chain
+            .commits_newest_first
+            .iter()
+            .flat_map(|commit| &commit.parsed_header.header.section_index)
+            .filter(|section| section.section_type == V2SectionType::IndexRun)
+            .map(|section| section.length)
+            .max()
+            .unwrap_or(0);
+        let catalog_scratch = referenced_run_commits
+            .iter()
+            .flat_map(|commit| &commit.parsed_header.header.section_index)
+            .filter(|section| section.section_type == V2SectionType::IndexRun)
+            .map(|section| section.length)
+            .max()
+            .unwrap_or(0);
+        reachability.current_catalog_max_run_bytes = reachability
+            .current_catalog_max_run_bytes
+            .max(catalog_scratch)
+            .max(current_run_max);
+        reachability.history_peak_pending_bytes = reachability.history_peak_pending_bytes.max(
+            reachability
+                .chain_retained_bytes
+                .checked_add(
+                    super::repository::metadata_section_buffer_bytes(
+                        catalog_scratch,
+                        limits.read_chunk_bytes,
+                    )?
+                    .max(
+                        reachability
+                            .current_max_section_bytes
+                            .min(limits.read_chunk_bytes),
+                    ),
+                )
+                .ok_or(V2FormatError::MaintenanceBudgetExceeded)?,
+        );
         if !referenced_run_commits.is_empty() {
             reachability.include_chain(
                 &V2ReplayChain {
@@ -2163,7 +2224,7 @@ where
                             .saturating_add(reachability.graph_head_count),
                     )?;
                     let commit = self
-                        .read_replay_commit_at(&root.commit_key, root.version_id.as_ref())
+                        .read_commit_facts_at(&root.commit_key, root.version_id.as_ref())
                         .await?;
                     if commit.parsed_header.header.self_ref.sequence != root.sequence
                         || commit.parsed_header.header.body_digest != root.body_digest
@@ -2227,6 +2288,7 @@ where
     fn remaining_graph_limits(
         &self,
         reachability: &V2ReachabilityState,
+        budgets: V2MaintenanceBudgets,
     ) -> V2Result<V2ReplayLimits> {
         let configured = self.options().replay_limits;
         let used_commits = usize::try_from(reachability.chain_get_count)
@@ -2241,6 +2303,7 @@ where
             .ok_or(V2FormatError::ReplayBudgetExceeded)?;
         let max_retained_bytes = configured
             .max_retained_bytes
+            .min(budgets.max_history_pending_bytes)
             .checked_sub(reachability.chain_retained_bytes)
             .ok_or(V2FormatError::ReplayBudgetExceeded)?;
         Ok(V2ReplayLimits {

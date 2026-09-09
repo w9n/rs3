@@ -123,68 +123,54 @@ impl<S: BlobStore> V2CommitStore<S> {
         let RecoveryPageLocation::Exact {
             anchor,
             section_ordinal,
+            ..
+        } = &reference.location
+        else {
+            return Err(V2FormatError::InvalidRecoveryHistory);
+        };
+        let commit = self
+            .read_commit_facts_at(&anchor.commit_key, anchor.version_id.as_ref())
+            .await?;
+        let bytes = self
+            .read_metadata_section(&commit, *section_ordinal, u64::MAX)
+            .await?;
+        self.decode_recovery_page(reference, &commit, bytes)
+    }
+
+    /// Decodes only the referenced page; its old registry never becomes authority.
+    pub(in crate::v2) fn decode_recovery_page(
+        &self,
+        reference: &RecoveryPageRef,
+        facts: &V2ReplayCommit,
+        bytes: bytes::Bytes,
+    ) -> V2Result<RecoveryPage> {
+        let RecoveryPageLocation::Exact {
+            anchor,
+            section_ordinal,
             page_index,
         } = &reference.location
         else {
             return Err(V2FormatError::InvalidRecoveryHistory);
         };
-        let metadata = self
-            .store()
-            .head_at(&anchor.commit_key, anchor.version_id.as_ref())
-            .await
-            .map_err(|_| V2FormatError::StorageOperationFailed)?;
-        if metadata.object_id != anchor.commit_key || metadata.version_id != anchor.version_id {
-            return Err(V2FormatError::InvalidRecoveryHistory);
-        }
-        let parsed = self
-            .read_commit_header_at(&anchor.commit_key, anchor.version_id.as_ref())
-            .await?;
-        let header = &parsed.header;
-        if header.self_ref.sequence != anchor.sequence
+        let header = &facts.parsed_header.header;
+        if facts.version_id != anchor.version_id
+            || header.self_ref.commit_key != anchor.commit_key
+            || header.self_ref.sequence != anchor.sequence
             || header.body_digest != anchor.body_digest
             || header.signing_key_id != anchor.signing_key_id
         {
             return Err(V2FormatError::InvalidRecoveryHistory);
         }
-        crate::v2::commit::validate_v2_commit_object_len(&parsed, metadata.content_len)?;
-        let ordinal =
-            usize::try_from(*section_ordinal).map_err(|_| V2FormatError::InvalidRecoveryHistory)?;
-        let descriptor = header
+        let ordinal = *section_ordinal as usize;
+        if header
             .section_index
             .get(ordinal)
-            .ok_or(V2FormatError::InvalidRecoveryHistory)?;
-        if descriptor.section_type != V2SectionType::Recovery {
+            .is_none_or(|section| section.section_type != V2SectionType::Recovery)
+        {
             return Err(V2FormatError::InvalidRecoveryHistory);
         }
-        let length = usize::try_from(descriptor.length)
-            .map_err(|_| V2FormatError::RecoveryHistoryCapacity)?;
-        if length > section::MAX_RECOVERY_SECTION_BYTES {
-            return Err(V2FormatError::RecoveryHistoryCapacity);
-        }
-        let offset = (parsed.sections_start as u64)
-            .checked_add(descriptor.offset)
-            .ok_or(V2FormatError::SectionBounds)?;
-        let bytes = self
-            .read_commit_range_at(
-                &anchor.commit_key,
-                anchor.version_id.as_ref(),
-                rs3_storage::ByteRange::Slice {
-                    offset,
-                    len: descriptor.length,
-                },
-            )
-            .await?;
-        if bytes.len() != length || crate::v2::digest_v2_section(&bytes) != descriptor.digest {
-            return Err(V2FormatError::InvalidRecoveryHistory);
-        }
-        let mut retained_sections = vec![None; header.section_index.len()];
-        retained_sections[ordinal] = Some(bytes);
-        let commit = V2ReplayCommit {
-            parsed_header: parsed,
-            version_id: anchor.version_id.clone(),
-            object_len: metadata.content_len,
-            retained_sections,
-        };
+        let mut commit = facts.header_facts();
+        commit.retained_sections[ordinal] = Some(bytes);
         let (_, history) = self
             .decode_recovery_section(&commit)?
             .ok_or(V2FormatError::InvalidRecoveryHistory)?;
