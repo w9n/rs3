@@ -755,7 +755,7 @@ Compaction and catalog publication use this order:
 2. Rank a bounded full window and one contiguous subset from authenticated
    catalog sizes. Fetch the better estimate first; try the alternative only if
    actual sharding or nonreduction warrants it, reusing fetched sources. At most
-   128 unique runs, 16 MiB of stored run sections and 131,072 mutations are
+   256 unique runs, 16 MiB of stored run sections and 131,072 mutations are
    considered. Verify every fetched source using its signed header and exact run
    section; unrelated payload and recovery sections need no download. Corruption
    is fatal, while unfetched references remain unchanged.

@@ -228,7 +228,7 @@ the cold-read counters separately from recovery.
 These lightweight lanes qualify write amplification, bounded recovery, direct
 cold sentinel reads, sentinel correctness, and the recovered active-run budget.
 Automatic compaction performs bounded passes beginning at 256 active runs,
-each selecting at most 128 active runs across levels 0 and 1.
+each selecting at most 256 active runs across levels 0 and 1.
 Each window is also capped at 131,072 mutations and 16 MiB of stored run
 sections; catalog-only selection favors more runs and lower rewrite cost.
 Accepted blinded-key generations identify obsolete upserts after source

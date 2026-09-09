@@ -62,6 +62,12 @@ syncs; it does not provide versioning or Object Lock. Construction is synchronou
 A canceled filesystem read or listing must be reopened, because reusing its
 cursor fails rather than silently skipping work completed by a detached worker.
 
+Compaction can combine up to 256 small source runs while keeping its 16 MiB
+encoded-source and 131,072-mutation bounds. The wider window amortizes root
+publication across more runs. Catalog estimates still select a cheaper subset
+when rewriting large older shards would cost more. Recovery page capacity,
+retention promises, reader limits and the wire format are unchanged.
+
 ## Repository State
 
 !!! warning "Format implementation status"
@@ -132,7 +138,7 @@ deduplication for the primary client workload.
 
 `v03` replaces monolithic index snapshots with an encrypted LSM-style index.
 Recent immutable foreground runs are level 0. Each compaction selects at most
-128 active runs, including older level-1 shards, as one contiguous
+256 active runs, including older level-1 shards, as one contiguous
 generation window with at most 131,072 mutations and 16 MiB of stored run
 sections. That read window favors more source runs, then lower mutation/byte
 cost and older windows. Signed catalog sizes rank the complete window and one
