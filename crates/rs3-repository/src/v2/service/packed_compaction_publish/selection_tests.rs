@@ -376,3 +376,59 @@ fn incremental_challenger_scoring_matches_exhaustive_costs() {
         );
     }
 }
+
+#[tokio::test]
+async fn append_cliff_128k_shards_stay_unfetched_in_wider_envelope() {
+    let mut catalog = vec![(128, 128 * 1024); 129];
+    catalog.extend(vec![(1, 1024); 127]);
+    let envelope = super::super::compaction_window(&catalog).expect("byte-bounded envelope");
+    assert_eq!(envelope, 2..256);
+    assert_eq!(
+        compaction_challenger(&catalog[envelope.clone()]).expect("challenger"),
+        Some(127..254),
+    );
+
+    let mut namespace = rs3_index::NamespaceIndex::new();
+    let older_keys = (0..128).collect::<Vec<u8>>();
+    let sources = envelope
+        .clone()
+        .map(|index| {
+            let generation = index as u64 + 1;
+            if index < 129 {
+                append_source(generation, &older_keys, &mut namespace)
+            } else {
+                append_source(generation, &[(index - 1) as u8], &mut namespace)
+            }
+        })
+        .collect::<Vec<_>>();
+    for (source, &(mutations, _)) in sources.iter().zip(&catalog[envelope.clone()]) {
+        assert_eq!(source.run.mutations.len(), mutations as usize);
+    }
+    let (result, reads, plans) = fixture_plan(
+        sources,
+        &catalog[envelope.clone()],
+        &IndexRunLimits::default(),
+        &namespace,
+    )
+    .await;
+    let (selected, output) = result.expect("only newer append entries compact");
+    assert_eq!(selected, 127..254);
+    assert_eq!(
+        envelope.start + selected.start..envelope.start + selected.end,
+        129..256,
+        "every older catalog reference stays outside the publication replacement slice"
+    );
+    assert_eq!(
+        reads,
+        std::iter::once(127..254).collect::<Vec<_>>(),
+        "none of the 127 older shards inside the envelope is fetched"
+    );
+    assert_eq!(plans, 1);
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].mutations.len(), 127);
+    for (key, mutation) in (128..255_u8).zip(&output[0].mutations) {
+        assert!(matches!(mutation, IndexMutation::Upsert(entry)
+            if entry.blind_key == IndexBlindKey::from_bytes([key; 32])
+            && entry.generation == Sequence::new(u64::from(key) + 2)));
+    }
+}
