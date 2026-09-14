@@ -8,6 +8,7 @@ spec:
   type: {{ .Values.service.type }}
   selector:
     {{- include "rs3-gateway.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
   ports:
     - name: s3
       port: {{ .Values.service.port }}

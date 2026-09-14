@@ -1,5 +1,9 @@
 # Operations
 
+Start with [Deploy, Back Up, and Restore](deploy-backup-restore.md) for the
+one-time Helm setup and routine client workflow. This page covers operational
+settings, checks, and advanced recovery.
+
 This page describes the current operator-facing shape. Treat it as development
 documentation until the repository format and hardened anchor path are stable.
 
@@ -27,8 +31,13 @@ cargo run -p rs3-server -- doctor --profile production --probe
 The production profile rejects memory anchors, retention-unsupported local
 backends, plaintext S3-compatible backend endpoints, missing gateway
 credentials, and missing repository retention for mutation-capable serving.
-Every finding includes a remediation hint. Probe mode additionally checks
-backend reachability, v2 anchor readability (including Kubernetes Lease access
+Every finding includes a remediation hint. Serving and initialization do not
+require an offline recovery signer, so a missing `RS3_RECOVERY_PUBLIC_KEY` is
+reported as the non-blocking `recovery.cluster-loss-readiness` warning:
+signed bundle import after cluster loss needs that key and a signed
+off-cluster bundle, and the warning says so before the outage rather than
+during it. Probe mode additionally checks
+backend reachability, v3 anchor readability (including Kubernetes Lease access
 when configured), and keyring envelope readability without printing backend
 object names or configured Kubernetes object names.
 
@@ -57,6 +66,16 @@ Operators MUST configure a backend lifecycle rule that aborts incomplete
 multipart uploads, because client disconnects and crashes can leave provider
 temporary parts that repository GC cannot see.
 
+Each nonempty standalone upload incurs one complete ciphertext upload and one
+complete readback before publication. The gateway checks the returned exact
+version, length, required protection and complete ciphertext digest through EOF.
+Verification uses the provider's bounded streaming interface, consumes chunks
+of at most 1 MiB and fails closed if that interface is unavailable; it does not
+sample bytes or fall back to buffering the whole object. Account for this full
+readback when estimating backend transfer cost and upload latency. Versioned
+S3 GET responses must echo the requested version ID; missing or different IDs
+are rejected before the body is consumed.
+
 A completed standalone object remains invisible until its exact encrypted
 reference is anchored. Ambiguous multipart completion or a later publication
 failure can therefore leave an opaque repository orphan. Status and guarded
@@ -76,7 +95,7 @@ provider:
         "Prefix": "<backend-prefix>/"
       },
       "AbortIncompleteMultipartUpload": {
-        "DaysAfterInitiation": 1
+        "DaysAfterInitiation": 2
       }
     }
   ]
@@ -94,11 +113,14 @@ tooling. `GET /admin/posture` is cheap enough for routine polling and reports
 runtime posture, profile findings, backend and anchor kind, retention settings,
 and last persisted provider-conformance evidence. `GET /admin/status` adds
 restore-trust and maintenance verification and may touch repository state. For
-v2 repositories, status includes verified commit-chain counts, orphan counts,
+v3 repositories, status includes verified commit-chain counts, orphan counts,
 and commit-retention renewal counts using the built-in seven-day renewal
-horizon. Full-maintenance dry runs can also include explicit protected
-historical roots; those roots block orphan deletion until the operator
-deliberately discards them from the maintenance plan.
+horizon. For retained Object Lock repositories, accepted predecessors are
+registered automatically in the encrypted
+recovery history and are included in maintenance protection. Full-maintenance
+dry runs can also include explicit externally supplied historical roots; those
+roots block orphan deletion until the operator deliberately discards them from
+the maintenance plan.
 Neither report exposes a path browser, configured bucket names, backend
 prefixes, repository IDs, client-visible object paths, or secret material. Treat
 these reports as preview fact models, not as stable workflow APIs.
@@ -139,8 +161,10 @@ reference.
 ## Keys And Bootstrap
 
 The gateway uses an encrypted keyring envelope. Operators provide a stable
-repository ID, a stable public salt, and a wrapping-key source. For an anchored
-repository, startup reads the accepted v2 anchor, verifies the signed commit
+repository ID and a wrapping-key source; the public salt is generated at
+initialization, journaled, and recovered from the verified envelope on every
+later start, so it needs no separate custody. For an anchored
+repository, startup reads the accepted v3 anchor, verifies the signed commit
 chain and format root, and opens the keyring envelope bound through that format
 root. It does not trust S3 listing order or a mutable "latest" object to choose
 repository state.
@@ -168,9 +192,10 @@ Operational rules:
   password KDF before setting `RS3_KEYRING_WRAPPING_KEY_HEX`.
 - Keep wrapping keys, KMS access, HSM access, or Vault tokens outside the object
   store and outside broad cluster write credentials.
-- Provide a stable salt once per repository and keep it with trusted repository
-  configuration and recovery material.
-- Treat salts as public restore metadata, not as second passwords.
+- Leave `RS3_REPOSITORY_SALT_HEX` unset unless you must pin a known salt; a
+  pinned value that disagrees with the envelope fails startup rather than
+  silently switching context.
+- Treat salts as public envelope metadata, not as second passwords.
 - Keep historical keys available for at least the maximum retention window.
 - Do not destroy a key while any retained commit can reference data that
   requires it.
@@ -179,14 +204,14 @@ For a first empty repository, configure the repository context and wrapping key:
 
 ```sh
 RS3_REPOSITORY_ID=prod-backups
-RS3_REPOSITORY_SALT_HEX=<stable-public-salt-hex>
 RS3_KEYRING_WRAPPING_KEY_ID=wrap-2026-05 # optional; defaults to wrap-v1
 RS3_KEYRING_WRAPPING_KEY_HEX=<wrapping-key-hex>
 ```
 
 In Helm, set `repositoryKeys.create=true` or provide
-`repositoryKeys.existingSecret`. The required Secret keys are `salt-hex` and
-`wrapping-key-hex`; `wrapping-key-id` is optional and defaults to `wrap-v1`;
+`repositoryKeys.existingSecret`. The required Secret key is
+`wrapping-key-hex`; `salt-hex` optionally pins the public salt;
+`wrapping-key-id` is optional and defaults to `wrap-v1`;
 `envelope-object-id` is an optional override. Helm values stay declarative; the
 gateway writes the encrypted envelope object, not mutated chart state.
 
@@ -196,12 +221,133 @@ repository and recover a missing anchor from a trusted restore bundle.
 For a one-shot bootstrap, run the configured binary with initialization enabled:
 
 ```sh
-RS3_ALLOW_REPOSITORY_INIT=true cargo run -p rs3-server -- init --format json
+RS3_ALLOW_REPOSITORY_INIT=true cargo run -p rs3-server -- init --profile local --format json
 ```
 
-The command writes the initial keyring, format root, genesis commit, and anchor,
-then reloads the accepted chain before exiting. Keep `repository.allowInit=false`
-for normal gateway serving after bootstrap.
+Init defaults to the `production` posture profile. The example selects `local`
+for development; retained deployments should keep the production default.
+This checks the production configuration before backend or Lease access while
+allowing deliberate initialization. Retention, the serving writer guard,
+renewal margins and current provider-conformance evidence
+remain required. Journaled S3 init can generate matching provider evidence before
+repository publication; configured external evidence must already pass. Init
+does not start an admin listener. Normal production serving continues to reject
+initialization permission.
+
+The command checks S3 retention and lifecycle policy before initialization.
+For a Kubernetes anchor, it then acquires and renews the writer Lease, including
+when the serving writer-guard setting is off. Genesis publication checks that
+fence in the anchor CAS. The binary needs the `s3` and `k8s` features for that
+deployment; the example above uses the local development defaults.
+
+Init writes the initial keyring, format root, genesis commit, and anchor, then
+reloads the accepted chain and releases the Lease before exiting. Cancellation
+stops renewal and lets the Lease expire. A journal already completed under the
+current configuration is verified read-only without the Lease. When init must
+initialize or requalify, it waits out only an unchanged stale holder; a live
+gateway that keeps renewing makes init fail fast rather than wait, because a
+rollout that waits for this init would otherwise deadlock.
+Keep `repository.allowInit=false` for
+normal serving. Kubernetes runtime construction also refuses initialization
+permission; use the journaled init command before starting the gateway.
+
+Writable Kubernetes init requires `--journal-secret NAME` (or
+`RS3_INIT_JOURNAL_SECRET`) in the anchor namespace. Declare an empty Secret
+annotated `rs3.rs/bootstrap-journal: v1` and grant the init principal `get` and
+`update` on that Secret, in addition to the writer Lease permissions. The chart
+can declare this journal with `bootstrap.enabled=true`. Read-only verification and local memory
+anchors do not use a journal.
+
+For S3, the journal also stores the qualification report and one random probe
+root outside the repository prefix. It reserves at most three complete probe
+runs across retries, with a distinct suffix for each attempt and one SDK attempt
+per operation. An ambiguous run consumes its reservation. Matching, current
+evidence is reused; expired or changed-build evidence needs another reservation.
+Exhaustion requires reviewed matching external evidence, not a reset journal.
+Governance qualification additionally requires the explicit bypass-review flag
+and configured principal fingerprint. Retained or indefinitely held probe
+objects may remain after any attempt. The report is stored in the journal's
+`state.evidence` JSON field and projected as `provider-conformance.json` in the
+same Secret revision. Externally provided reports are read and validated,
+never overwritten.
+
+For journaled S3 initialization, bootstrap then publishes one small synthetic
+object through the normal repository API. A fresh repository instance reopens
+the accepted keyring and chain with empty decrypted caches and checks its exact
+bytes. Bootstrap publishes a logical tombstone and verifies the key is absent
+before its initialization gate can pass. The journal records up to three PUT
+and three DELETE attempts before calls; accepted state reconciles lost replies.
+Retries reuse the same opaque fixture identity, and a completed step does not
+write another fixture. The encrypted fixture and tombstone obey normal retention
+and GC rules; logical cleanup does not immediately erase physical ciphertext.
+
+Kubernetes onboarding uses the declared repository-key Secret and the live Lease
+as its custody and accepted-state authority. It does not require an offline
+recovery signer or `RS3_RECOVERY_PUBLIC_KEY`. Bootstrap reopens the encrypted
+keyring using the configured wrapping key and verifies real payload bytes before
+admission. Back up the key Secret, repository configuration and trusted anchor
+outside the cluster if recovery after total cluster loss is required. The
+bootstrap journal is progress evidence, not a replacement anchor. A completed
+journal with a missing anchor still refuses initialization.
+
+The separate portable bundle verification/import commands require their explicit
+recovery trust inputs. Those requirements do not apply to normal Kubernetes
+onboarding or reopening a repository with its live trusted anchor.
+
+Init JSON uses `rs3.v2-init.v2`. `payload_restore_verified` reports whether this
+journaled fixture step completed. It does not attest independent off-cluster
+recovery. Its `probe_attempts` field reports consumed
+qualification reservations, and `probe_observation` reports the last bounded
+observation of the reserved probe namespace. The observation includes its time
+and covered attempts, distinct observed versions, bytes from verified exact
+HEADs, reported retention deadlines, legal holds and unavailable protection
+metadata. It uses at most four LIST pages, 128 raw members and 32 exact HEADs,
+with no payload reads or backend mutations. A matching repeat init reuses that
+timestamped observation rather than rescanning. Failed runs preserve available
+observations in the journal too.
+
+These counts are observations, not proof that all leftovers are visible. Even
+`listing_exhausted=true` only describes the provider's returned pagination;
+eventual consistency can hide versions. A warning identifies denied, malformed
+or budget-limited observations. `multipart_sessions_observed=false` means
+unfinished multipart sessions were not inventoried, not that none remain.
+Legal holds may protect versions indefinitely. Retention deadlines alone never
+authorize deletion, and the report does not perform cleanup.
+
+For an S3 gateway with a Kubernetes anchor in the release namespace, enable
+`bootstrap.enabled` in the chart and keep `repository.allowInit=false`.
+The chart declares a normal initialization Job plus a read-only deployment
+init container, sharing the serving image, backend credentials and service
+account. No manual report transfer is required. The startup wait reads projected
+journal state and the configured evidence file before starting the gateway;
+the gateway then verifies the live anchor normally. Every Helm revision runs
+a new Job and reuses the journal; a Job that finds the journal completed under
+the current configuration verifies read-only without the Lease. Qualification
+is reused only when its bound implementation and policy match; otherwise the
+Job requalifies under the Lease after the `Recreate` rollout stops the previous
+gateway pod.
+This orchestrates initialization, provider evidence and the bootstrap payload
+round trip. Independently verified
+off-cluster recovery export is still a separate requirement.
+
+The journal Secret is retained on Helm uninstall. Preserve it with the anchor
+when configuring GitOps pruning; do not remove its runtime-managed data or
+ownership annotations from a declarative manifest. An existing dedicated
+Secret can be selected through `bootstrap.existingJournalSecret`. The bootstrap
+principal receives `get`/`update` on that exact Secret; it receives no permission
+to create or enumerate Secrets.
+
+The journal persists the exact encrypted keyring, format root and signed genesis
+before their uploads. Repeating init with the same configuration resumes the
+unfinished stage and verifies the accepted chain. Each artifact has three
+persisted upload allowances; a lost reply is reconciled before another allowance
+is reserved. Exhaustion stops new uploads but still permits reconciliation of
+an existing exact object. Do not delete or reset the journal to retry.
+
+A completed journal with a missing anchor requires explicit recovery. Existing
+backend data without a matching unfinished journal also requires recovery;
+init does not silently start a second repository. The journal is part of the
+trusted Kubernetes state and does not replace off-cluster recovery material.
 
 Inspect an existing envelope when auditing key lifecycle state:
 
@@ -214,8 +360,8 @@ cargo run -p rs3-server -- keyring inspect \
 
 This opens the envelope and prints public key descriptors only. It does not
 print repository data keys or wrapping-key material. The command uses the
-normal `RS3_BACKEND_*`, `RS3_REPOSITORY_ID`, and `RS3_REPOSITORY_SALT_HEX`
-configuration.
+normal `RS3_BACKEND_*` and `RS3_REPOSITORY_ID` configuration and reports the
+public salt it recovered from the envelope.
 
 Rewrap the keyring envelope with a new wrapping key without rewriting backup
 data:
@@ -242,21 +388,26 @@ cryptographic revocation mechanism.
 Keep the old wrapping-key source available for restore paths that still trust
 format roots or commits bound to the old envelope. A newly written rewrapped
 envelope only becomes active repository state after a later accepted format or
-keyring update binds it.
+keyring update binds it, and this preview provides no such activation: an
+anchored gateway keeps opening the envelope its format root binds with the old
+wrapping key. Pointing `RS3_KEYRING_ENVELOPE_OBJECT_ID` at the rewrapped
+object on an anchored repository is rejected at startup rather than silently
+ignored. The rewrapped envelope is a hygiene artifact for future activation
+and for unanchored recovery tooling that names it explicitly.
 When writing envelopes outside the gateway, set envelope retention deliberately
 with `RS3_REPOSITORY_RETENTION_MODE` and `RS3_REPOSITORY_RETENTION_DAYS`;
 retention protects restore metadata from deletion but does not make a leaked
 old envelope safe.
 
-Purpose-specific v2 data-key rotation is not exposed as a production-preview
+Purpose-specific v3 data-key rotation is not exposed as a production-preview
 CLI command yet. Do not use older rotation workflows against a
-v2 repository. Until v2 rotation is implemented, keep historical keys enabled
+v3 repository. Until v3 rotation is implemented, keep historical keys enabled
 and treat wrapping-key rewrap as envelope hygiene only.
 
 Before disabling or retiring a historical key, first verify the trusted anchored
 commit chain with `rs3 verify-bundle`. That verifies the preserved bundle,
 format root, keyring envelope, and reachable commit chain are still usable, but
-it is not a data-key retirement decision. v2-aware retirement tooling is not
+it is not a data-key retirement decision. v3-aware retirement tooling is not
 part of the current production-preview CLI, so keep historical data keys for at
 least the maximum provider-retention window.
 
@@ -281,7 +432,12 @@ RS3_ANCHOR_FIELD_MANAGER=rs3-server
 ```
 
 If the configured anchor cannot be read or advanced, writes must fail closed.
-Do not silently fall back to a memory anchor.
+Do not silently fall back to a memory anchor. An advance whose reply is lost is
+settled by a fencing write on the Lease: once that resource-version-guarded
+update lands, the earlier request can no longer apply, so the state it observes
+decides whether the publication was accepted. If the fencing write itself
+fails, the outcome is reported as unknown and further mutations stay blocked
+until the chain is reloaded from the anchor.
 
 The read-write gateway coordinates ownership and accepted anchor state on this
 same Lease. Ownership takeover is based on an unchanged renewal counter observed
@@ -328,9 +484,31 @@ Provider retention is capability-gated. A backend that cannot extend retention
 must return an unsupported operation rather than pretending the object is
 protected.
 
+Recovery history has a separate logical window. `RS3_RECOVERY_WINDOW_DAYS=30`
+is the default for newly published points; `RS3_REPOSITORY_RETENTION_DAYS` is
+the physical provider-protection floor and must cover the automatic maintenance
+interval plus its renewal safety horizon. The provider may impose a longer
+floor, and accepted deadlines are never shortened. Retained read-write serving
+requires `RS3_MAINTENANCE_MODE=auto`; set `RS3_RECLAMATION_ENABLED=false` to
+keep renewal active while disabling physical orphan deletion.
+
+The recovery registry holds at most about 4.2 million live points, roughly
+1.62 accepted commits per second sustained across a thirty-day window. A
+gateway that reaches that ceiling refuses every write with a recovery-history
+capacity error rather than shortening any promise; writes resume as the oldest
+history pages expire. Batching small writes keeps sustained publication rates
+far below the ceiling; see the
+[repository format reference](reference/repository-format.md) for the bounds.
+This is a format ceiling, not an operating capacity: shared metadata, encoded
+pending-buffer and reachable-target budgets can refuse growth much earlier.
+Size the [history budgets](reference/configuration.md#maintenance)
+against the measured workload and available resources; raising a cap does not
+change retention promises. The [performance reference](performance.md) records
+qualified counts, explicit budgets and provider boundaries.
+
 ## Full Maintenance
 
-The read-write gateway runs the v2 full-maintenance supervisor in process. It
+The read-write gateway runs the v3 full-maintenance supervisor in process. It
 renews retention for the exact restore graph and reclaims exact-version orphans
 from one immutable, budgeted plan. Before apply, the coordinator drains pending
 commit work, excludes new repository mutations with the existing staging lock,
@@ -407,9 +585,10 @@ are rendered only when both `metrics.enabled` and `alerts.enabled` are true.
 Treat the restore bundle as public but integrity-sensitive recovery metadata.
 It should live outside the object-store account and outside the cluster whose
 Lease it may need to recreate. Backend credentials alone are not enough for
-disaster recovery; the bundle, repository ID, public salt, wrapping-key source,
-and selected retention context must agree before a new cluster imports an
-anchor. The operational procedure is [Restore Under Attack](runbooks/restore-under-attack.md).
+disaster recovery; the bundle, repository ID, wrapping-key source, and
+selected retention context must agree before a new cluster imports an anchor,
+and the signed bundle's salt digest must match the format root the anchor
+binds. The operational procedure is [Restore Under Attack](runbooks/restore-under-attack.md).
 
 ## Metrics
 
@@ -433,6 +612,34 @@ exhaustion, and exclusion-window duration under the `rs3_maintenance_*` metric
 prefix. The optional Helm `PrometheusRule` warns on an approaching or critical
 renewal deadline, repeated failures, budget exhaustion, and stale success. The
 rules and metric labels contain no repository paths or object identifiers.
+
+Automatic maintenance also measures payload space inside packs that still have
+at least one record reached by current state or conservatively protected
+recovery dependencies:
+
+| Metric | Meaning |
+| --- | --- |
+| `rs3_maintenance_packed_payload_stored_bytes` | Total ciphertext bytes in those exact packs. |
+| `rs3_maintenance_packed_payload_referenced_bytes` | Distinct record ciphertext bytes reached across current and protected dependencies; shared copies count once. |
+| `rs3_maintenance_packed_payload_unreferenced_bytes` | Stored minus referenced bytes: a conservative lower bound on unused space inside those packs. |
+| `rs3_maintenance_packed_payload_observed_timestamp_seconds` | Unix time of the last successful automatic planning observation. |
+
+These gauges are `NaN` before the first complete observation. Failed planning
+retains the previous values and timestamp; check freshness before interpreting
+them. They update from existing bounded metadata traversal without payload
+downloads or additional object-store requests. History marking can preserve
+obsolete entries in protected runs, so it may overestimate referenced bytes and
+underestimate unused space. Accounting runs only for quick maintenance reports,
+not foreground publication. The totals exclude detached payloads,
+commit/index overhead and wholly unreferenced packs, which belong to ordinary
+GC accounting. The on-demand admin maintenance report exposes the byte totals
+as `packed_payload_*_bytes` under its `v2` summary, alongside its computation time.
+
+Unreferenced pack bytes are not immediately deletable. Existing GC deletes whole
+unreferenced object versions after protection and age checks; it cannot remove
+individual regions from a pack. Payload-pack cleaning is not implemented. A
+future cleaner would rewrite surviving records and wait until the old carrier
+is no longer needed by any protected root and backend retention allows deletion.
 
 The Helm deployment uses an HTTP startup probe with a ten-minute budget before
 enabling liveness and readiness probes. This lets bounded commit and index
@@ -465,7 +672,7 @@ control surfaces, not backup data browsers.
 ## Restore Posture
 
 For routine restores in a healthy repository, keep the single writer gateway in
-`read-write` and use the normal v2 anchor path. Velero writes restore
+`read-write` and use the normal v3 anchor path. Velero writes restore
 result artifacts after data restore; in normal operation those writes should be
 accepted, committed, and anchored like other repository mutations so Velero
 can report `Completed`.
@@ -475,14 +682,39 @@ verified commit chain and external anchor over any mode that repairs state
 automatically. If break-glass restore is added, it should require explicit
 operator input and leave an audit trail.
 
+When the live anchor and authenticated recovery registry are available, list
+and select an exact recovery point without changing the production namespace:
+
+```sh
+rs3 recovery-points --limit 100 --format json
+rs3 recovery-points --limit 100 --cursor '<next_cursor>' --format json
+
+rs3 serve \
+  --gateway-mode restore-readonly \
+  --recovery-point <sequence> \
+  --bind 127.0.0.1:9081
+```
+
+The cursor is bound to the live anchor. The selected view rechecks the anchor
+and protection deadline, rejects writes and deletes, and serves the selected
+logical namespace for restore. Copy recovered data to an isolated destination;
+copying it back is a separately reviewed normal write. This preview workflow
+does not rewind the live anchor or expose S3 `versionId` history. Use the
+[incident runbook](runbooks/restore-under-attack.md) for the trusted-bundle
+fallback when live authority is unavailable. A local retained RustFS Object Lock
+and Kubernetes Lease exercise passed graceful read-only and writer restarts,
+historical AWS CLI/rclone copyout and range reads, and actual compaction after 256
+writes. Deterministic controlled-time tests cover expiry, renewal, guard faults,
+and eligible exact-version GC. This does not establish a 30-day outage bound or
+general retained-provider qualification.
+
 !!! note "DR survival kit"
     Keep this material outside the object-store account and outside the namespace
     being protected:
 
     - repository ID
-    - public repository salt
     - wrapping-key source for the keyring envelope
-    - trusted v2 anchor position: sequence, commit key, commit object version ID
+    - trusted v3 anchor position: sequence, commit key, commit object version ID
       when available, commit body digest, signing key ID, and format-root
       reference
     - format-bound keyring-envelope reference
@@ -518,8 +750,9 @@ Run only one `read-write` gateway for a repository. Multiple independent
 writers cannot safely coordinate repository state without a stronger shared
 write protocol. Scaled restore readers should use `restore-readonly`.
 
-Disaster recovery into a new cluster requires the repository ID, public salt,
-wrapping-key source, and a trusted v2 anchor position from outside S3. Backend
+Disaster recovery into a new cluster requires the repository ID,
+wrapping-key source, and a trusted v3 anchor position from outside S3; the
+public salt is recovered from the format root that position binds. Backend
 objects alone are not a latest-state oracle because the backend can hide newer
 valid commits and replay older valid commits.
 
@@ -527,11 +760,31 @@ Export the trusted restore bundle from a healthy cluster or regular operations
 job and store it outside the object-store account:
 
 ```sh
-cargo run -p rs3-server -- export-restore-bundle --format json > rs3-restore-bundle.json
+cargo run -p rs3-server -- export-restore-bundle --output rs3-restore-bundle-unsigned.cbor --format json > rs3-restore-report.json
 ```
 
-Machine-readable commands reserve stdout for the report or bundle payload and
-write logs to stderr. Do not redirect stderr into preserved JSON artifacts.
+The CBOR artifact is written to `--output`, which must not already exist.
+JSON stdout is an inspection report, not an importable bundle. Logs go to stderr.
+
+The bundle contains public repository restore metadata: repository ID, accepted
+commit sequence, commit key, commit object version ID when available, commit
+body digest, signing key ID, format-root reference, and weak-subjectivity floor.
+It does not contain wrapping-key material. Export also prints
+`offline_signature_payload_hex`; sign those canonical bytes with an offline
+Ed25519 recovery key. Attach and verify the resulting signature before
+production import:
+
+```sh
+cargo run -p rs3-server -- attach-bundle-signature \
+  --bundle-file rs3-restore-bundle-unsigned.cbor \
+  --signature-hex <128-hex-character-signature> \
+  --public-key ed25519:<recovery-public-key-hex> \
+  --output rs3-restore-bundle.cbor
+```
+
+This command runs offline and verifies the signature before writing the signed
+CBOR artifact. The signature binds the repository, salt digest, complete anchor,
+recovery floor, and export time. Keep the signer private key outside the gateway.
 
 Verify the preserved bundle without writing a new anchor:
 
@@ -540,39 +793,34 @@ RS3_BACKEND_ENDPOINT=s3 \
 RS3_BACKEND_BUCKET=<bucket> \
 RS3_BACKEND_PREFIX=<repository-prefix> \
 RS3_REPOSITORY_ID=<repository-id> \
-RS3_REPOSITORY_SALT_HEX=<repository-salt-hex> \
 RS3_RECOVERY_PUBLIC_KEY=ed25519:<recovery-public-key-hex> \
 cargo run -p rs3-server -- verify-bundle \
-  --bundle-file rs3-restore-bundle.json \
+  --bundle-file rs3-restore-bundle.cbor \
   --min-sequence <external-floor-sequence> \
   --wrapping-key-hex-file <wrapping-key-hex-file>
 ```
 
-The bundle contains public repository restore metadata: repository ID, accepted
-commit sequence, commit key, commit object version ID when available, commit
-body digest, signing key ID, format-root reference, and weak-subjectivity floor.
-It does not contain wrapping-key material. Export also prints
-`offline_signature_payload_hex`; sign those canonical bytes with an offline
-Ed25519 recovery key and store the resulting hex signature in
-`offline_signature` before production import. The verifier opens the encrypted
-format root and keyring envelope, checks `RS3_RECOVERY_PUBLIC_KEY`, then
-verifies the anchor-selected signed commit chain to the nearest snapshot
-without mutating storage or the external anchor.
+The verifier opens the encrypted format root and keyring envelope, checks
+`RS3_RECOVERY_PUBLIC_KEY` and the bundle's salt digest against the format root,
+then verifies the anchor-selected signed commit chain to the nearest snapshot
+without mutating storage or the external anchor. The salt digest is part of
+the bundle contract: a bundle exported without it is refused, so re-export
+bundles that predate this release.
 
 The bundle is a weak-subjectivity checkpoint, not a permanent snapshot pin.
-Automatic maintenance protects the current anchor graph and does not register
-older exported roots. Refresh the preserved bundle after maintenance or major
-repository changes, and before the provider retention window covering its
-referenced versions can expire. Keep at least one previously verified bundle
+The automatic recovery registry protects accepted points and maintenance renews
+their referenced graph; it does not register older exported roots. Refresh the
+preserved bundle after maintenance or major repository changes, and before the
+provider retention window covering its referenced versions can expire. Keep at least one previously verified bundle
 until its replacement has been exported, signed, and verified.
 
-On a new cluster with a missing anchor, import the trusted v2 anchor from that
-bundle after configuring the same repository ID, salt, wrapping-key source,
+On a new cluster with a missing anchor, import the trusted v3 anchor from that
+bundle after configuring the same repository ID, wrapping-key source,
 backend, and retention settings:
 
 ```sh
-cargo run -p rs3-server -- import-v2-anchor \
-  --bundle-file rs3-restore-bundle.json \
+cargo run -p rs3-server -- import-anchor \
+  --bundle-file rs3-restore-bundle.cbor \
   --min-sequence <external-floor-sequence>
 ```
 
@@ -581,11 +829,11 @@ fields only from `--bundle-file`. The import verifies the named signed commit
 chain, format root, recovery signature, and keyring envelope before writing the
 missing anchor. Production import requires `RS3_RECOVERY_PUBLIC_KEY` and refuses
 an anchor sequence below the operator-supplied `--min-sequence`.
-It also lists stored v2 commits and refuses to import when it sees a higher
+It also lists stored v03 commits and refuses to import when it sees a higher
 commit sequence than the bundle names. Use `--force-rollback` only after an
 explicit rollback review accepts stranding those newer commits.
 
-Verify a trusted anchor position before relying on it for restore. For v2, the
+Verify a trusted anchor position before relying on it for restore. For v3, the
 offline verifier and anchor import path both verify the named signed commit
 chain, format root, and keyring envelope. Then run the restore client through
 the recovered gateway and verify restored application bytes. Use S3 CLI checks

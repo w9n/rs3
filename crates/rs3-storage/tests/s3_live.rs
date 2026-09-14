@@ -38,6 +38,36 @@ async fn live_s3_backend_satisfies_core_blob_store_contract() {
 }
 
 #[tokio::test]
+#[ignore = "requires RS3_TEST_S3_BUCKET and S3-compatible credentials"]
+async fn live_s3_rejected_multipart_parts_preserve_the_upload() {
+    let Some(target) = live_target() else {
+        eprintln!("skipping live S3 multipart test: RS3_TEST_S3_BUCKET is not set");
+        return;
+    };
+    let store = S3BlobStore::from_environment(target.config)
+        .await
+        .expect("S3 store");
+    common::assert_multipart_rejection_preserves_parts(&store, &target.provider_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires RS3_TEST_S3_OBJECT_LOCK=true and an Object Lock-enabled bucket"]
+async fn live_s3_current_delete_preserves_protected_versions() {
+    if !env_bool("RS3_TEST_S3_OBJECT_LOCK").unwrap_or(false) {
+        eprintln!("skipping live S3 Object Lock test: RS3_TEST_S3_OBJECT_LOCK is not true");
+        return;
+    }
+    let Some(target) = live_target() else {
+        eprintln!("skipping live S3 Object Lock test: RS3_TEST_S3_BUCKET is not set");
+        return;
+    };
+    let store = S3BlobStore::from_environment(target.config)
+        .await
+        .expect("S3 store");
+    common::assert_current_delete_preserves_protected_versions(&store, &target.provider_name).await;
+}
+
+#[tokio::test]
 #[ignore = "requires RS3_TEST_S3_OBJECT_LOCK=true and an Object Lock-enabled bucket"]
 async fn live_s3_object_lock_retention_round_trips_and_blocks_version_delete() {
     if !env_bool("RS3_TEST_S3_OBJECT_LOCK").unwrap_or(false) {

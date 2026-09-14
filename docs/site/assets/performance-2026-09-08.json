@@ -1,0 +1,4099 @@
+{
+  "date": "2026-09-08",
+  "baseline_revision": "408a3c4247b8a7a200ec8c7f7a832c4d23200359",
+  "container_candidate_revision": "453c2ff045c07a3361590137b0dbc2ede28b4dd5",
+  "local_candidate_revision": "43c6914396422da1b5272bea9c32bc15cca3ddcf",
+  "scope": "Three samples per lane on a shared host. Measured processes use CPUs 4-7 and a 16 GiB memory limit; Docker providers are unrestricted. Local scale uses the Dev profile, excluding automatic retained history. Not dedicated-runner or external-provider qualification.",
+  "manifest_sha256": {
+    "container": "30afc4c33e3e51fd895fe5af2d73167acdb356044d968fbb6bc9d4b34047c745",
+    "local": "6007a5640a4fc945ecd3ddc9ab8d9338215b0fb5bebff6e7326ae4d8557802ae"
+  },
+  "definitions": {
+    "backup_phase": "snapshot-create; repository-create is reported separately",
+    "direct_provider_requests": "backend_metrics.counts.requests from integration storage proxy",
+    "elapsed_scope": "Existing client workload elapsed; excludes gateway readiness/setup. Paired runner wall-clock overhead is separate.",
+    "gateway_provider_requests": "sum put/get/head/list/delete/extend_retention/set_legal_hold/flush from backend_metrics.counts",
+    "rss": "gateway_process.vm_hwm_bytes is sampled process high-water RSS; vm_rss_bytes is the endpoint sample, not whole-workload peak. Direct proxy/client RSS unavailable."
+  },
+  "units": {
+    "elapsed": "milliseconds",
+    "provider_bytes": "bytes",
+    "rss": "bytes"
+  },
+  "standalone": {
+    "standalone-gateway-1": {
+      "baseline": {
+        "plaintext_mib_s": {
+          "values": [
+            172.75393838075985,
+            176.96269400644758,
+            178.09489217237245
+          ],
+          "median": 176.96269400644758,
+          "min": 172.75393838075985,
+          "max": 178.09489217237245
+        },
+        "elapsed_ms": {
+          "values": [
+            2963.753026,
+            2893.265219,
+            2874.871937
+          ],
+          "median": 2893.265219,
+          "min": 2874.871937,
+          "max": 2963.753026
+        },
+        "peak_rss_bytes": {
+          "values": [
+            92033024,
+            106708992,
+            91430912
+          ],
+          "median": 92033024,
+          "min": 91430912,
+          "max": 106708992
+        },
+        "write_amp": {
+          "values": [
+            1.0002696514089457,
+            1.0002696514089457,
+            1.0002696514089457
+          ],
+          "median": 1.0002696514089457,
+          "min": 1.0002696514089457,
+          "max": 1.0002696514089457
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002455115281714,
+            1.0002455115281714,
+            1.0002455115281714
+          ],
+          "median": 1.0002455115281714,
+          "min": 1.0002455115281714,
+          "max": 1.0002455115281714
+        }
+      },
+      "final": {
+        "plaintext_mib_s": {
+          "values": [
+            144.86713234843077,
+            147.20170053859096,
+            149.4640758897886
+          ],
+          "median": 147.20170053859096,
+          "min": 144.86713234843077,
+          "max": 149.4640758897886
+        },
+        "elapsed_ms": {
+          "values": [
+            3534.273091,
+            3478.2207390000003,
+            3425.572363
+          ],
+          "median": 3478.2207390000003,
+          "min": 3425.572363,
+          "max": 3534.273091
+        },
+        "peak_rss_bytes": {
+          "values": [
+            108417024,
+            108023808,
+            108539904
+          ],
+          "median": 108417024,
+          "min": 108023808,
+          "max": 108539904
+        },
+        "write_amp": {
+          "values": [
+            1.0002692043741166,
+            1.0002692043741166,
+            1.0002692043741166
+          ],
+          "median": 1.0002692043741166,
+          "min": 1.0002692043741166,
+          "max": 1.0002692043741166
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002443939410985,
+            1.0002443939410985,
+            1.0002443939410985
+          ],
+          "median": 1.0002443939410985,
+          "min": 1.0002443939410985,
+          "max": 1.0002443939410985
+        }
+      }
+    },
+    "standalone-gateway-2": {
+      "baseline": {
+        "plaintext_mib_s": {
+          "values": [
+            300.8022033501358,
+            299.060707998304,
+            306.58584984108563
+          ],
+          "median": 300.8022033501358,
+          "min": 299.060707998304,
+          "max": 306.58584984108563
+        },
+        "elapsed_ms": {
+          "values": [
+            1702.115217,
+            1712.027003,
+            1670.005344
+          ],
+          "median": 1702.115217,
+          "min": 1670.005344,
+          "max": 1712.027003
+        },
+        "peak_rss_bytes": {
+          "values": [
+            158060544,
+            125657088,
+            160264192
+          ],
+          "median": 158060544,
+          "min": 125657088,
+          "max": 160264192
+        },
+        "write_amp": {
+          "values": [
+            1.0002696514089457,
+            1.0002696514089457,
+            1.0002696514089457
+          ],
+          "median": 1.0002696514089457,
+          "min": 1.0002696514089457,
+          "max": 1.0002696514089457
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002455115281714,
+            1.0002455115281714,
+            1.0002455115281714
+          ],
+          "median": 1.0002455115281714,
+          "min": 1.0002455115281714,
+          "max": 1.0002455115281714
+        }
+      },
+      "final": {
+        "plaintext_mib_s": {
+          "values": [
+            258.16972465779475,
+            256.49382329312806,
+            257.3493188481067
+          ],
+          "median": 257.3493188481067,
+          "min": 256.49382329312806,
+          "max": 258.16972465779475
+        },
+        "elapsed_ms": {
+          "values": [
+            1983.191516,
+            1996.149463,
+            1989.5137470000002
+          ],
+          "median": 1989.5137470000002,
+          "min": 1983.191516,
+          "max": 1996.149463
+        },
+        "peak_rss_bytes": {
+          "values": [
+            145641472,
+            143470592,
+            143462400
+          ],
+          "median": 143470592,
+          "min": 143462400,
+          "max": 145641472
+        },
+        "write_amp": {
+          "values": [
+            1.0002692043741166,
+            1.0002692043741166,
+            1.0002692043741166
+          ],
+          "median": 1.0002692043741166,
+          "min": 1.0002692043741166,
+          "max": 1.0002692043741166
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002443939410985,
+            1.0002443939410985,
+            1.0002443939410985
+          ],
+          "median": 1.0002443939410985,
+          "min": 1.0002443939410985,
+          "max": 1.0002443939410985
+        }
+      }
+    },
+    "standalone-gateway-4": {
+      "baseline": {
+        "plaintext_mib_s": {
+          "values": [
+            479.08710756737605,
+            468.9779496183541,
+            480.9662066378977
+          ],
+          "median": 479.08710756737605,
+          "min": 468.9779496183541,
+          "max": 480.9662066378977
+        },
+        "elapsed_ms": {
+          "values": [
+            1068.699198,
+            1091.73578,
+            1064.52387
+          ],
+          "median": 1068.699198,
+          "min": 1064.52387,
+          "max": 1091.73578
+        },
+        "peak_rss_bytes": {
+          "values": [
+            202878976,
+            160321536,
+            165015552
+          ],
+          "median": 165015552,
+          "min": 160321536,
+          "max": 202878976
+        },
+        "write_amp": {
+          "values": [
+            1.0002696514089457,
+            1.0002696514089457,
+            1.0002696514089457
+          ],
+          "median": 1.0002696514089457,
+          "min": 1.0002696514089457,
+          "max": 1.0002696514089457
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002455115281714,
+            1.0002455115281714,
+            1.0002455115281714
+          ],
+          "median": 1.0002455115281714,
+          "min": 1.0002455115281714,
+          "max": 1.0002455115281714
+        }
+      },
+      "final": {
+        "plaintext_mib_s": {
+          "values": [
+            416.96735289284476,
+            416.0911596793195,
+            401.3239709187161
+          ],
+          "median": 416.0911596793195,
+          "min": 401.3239709187161,
+          "max": 416.96735289284476
+        },
+        "elapsed_ms": {
+          "values": [
+            1227.913898,
+            1230.499605,
+            1275.777289
+          ],
+          "median": 1230.499605,
+          "min": 1227.913898,
+          "max": 1275.777289
+        },
+        "peak_rss_bytes": {
+          "values": [
+            179568640,
+            149667840,
+            196444160
+          ],
+          "median": 179568640,
+          "min": 149667840,
+          "max": 196444160
+        },
+        "write_amp": {
+          "values": [
+            1.0002692043741166,
+            1.0002692043741166,
+            1.0002692043741166
+          ],
+          "median": 1.0002692043741166,
+          "min": 1.0002692043741166,
+          "max": 1.0002692043741166
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002443939410985,
+            1.0002443939410985,
+            1.0002443939410985
+          ],
+          "median": 1.0002443939410985,
+          "min": 1.0002443939410985,
+          "max": 1.0002443939410985
+        }
+      }
+    },
+    "standalone-gateway-8": {
+      "baseline": {
+        "plaintext_mib_s": {
+          "values": [
+            636.524874929757,
+            658.1845587775925,
+            301.48798381112397
+          ],
+          "median": 636.524874929757,
+          "min": 301.48798381112397,
+          "max": 658.1845587775925
+        },
+        "elapsed_ms": {
+          "values": [
+            804.367634,
+            777.897325,
+            1698.2434959999998
+          ],
+          "median": 804.367634,
+          "min": 777.897325,
+          "max": 1698.2434959999998
+        },
+        "peak_rss_bytes": {
+          "values": [
+            258723840,
+            251674624,
+            285495296
+          ],
+          "median": 258723840,
+          "min": 251674624,
+          "max": 285495296
+        },
+        "write_amp": {
+          "values": [
+            1.0002696514089457,
+            1.0002696514089457,
+            1.0002696514089457
+          ],
+          "median": 1.0002696514089457,
+          "min": 1.0002696514089457,
+          "max": 1.0002696514089457
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002455115281714,
+            1.0002455115281714,
+            1.0002455115281714
+          ],
+          "median": 1.0002455115281714,
+          "min": 1.0002455115281714,
+          "max": 1.0002455115281714
+        }
+      },
+      "final": {
+        "plaintext_mib_s": {
+          "values": [
+            565.7505845815559,
+            566.4881921627791,
+            568.0386608853051
+          ],
+          "median": 566.4881921627791,
+          "min": 565.7505845815559,
+          "max": 568.0386608853051
+        },
+        "elapsed_ms": {
+          "values": [
+            904.99245,
+            903.814086,
+            901.347114
+          ],
+          "median": 903.814086,
+          "min": 901.347114,
+          "max": 904.99245
+        },
+        "peak_rss_bytes": {
+          "values": [
+            233574400,
+            228941824,
+            255717376
+          ],
+          "median": 233574400,
+          "min": 228941824,
+          "max": 255717376
+        },
+        "write_amp": {
+          "values": [
+            1.0002692043741166,
+            1.0002692043741166,
+            1.0002692043741166
+          ],
+          "median": 1.0002692043741166,
+          "min": 1.0002692043741166,
+          "max": 1.0002692043741166
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002443939410985,
+            1.0002443939410985,
+            1.0002443939410985
+          ],
+          "median": 1.0002443939410985,
+          "min": 1.0002443939410985,
+          "max": 1.0002443939410985
+        }
+      }
+    },
+    "standalone-direct-8": {
+      "baseline": {
+        "plaintext_mib_s": {
+          "values": [
+            417.82143502711494,
+            405.68537107915114,
+            411.99111121578176
+          ],
+          "median": 411.99111121578176,
+          "min": 405.68537107915114,
+          "max": 417.82143502711494
+        },
+        "elapsed_ms": {
+          "values": [
+            1225.40388,
+            1262.0617949999998,
+            1242.745277
+          ],
+          "median": 1242.745277,
+          "min": 1225.40388,
+          "max": 1262.0617949999998
+        },
+        "peak_rss_bytes": {
+          "values": [
+            434122752,
+            489684992,
+            443236352
+          ],
+          "median": 443236352,
+          "min": 434122752,
+          "max": 489684992
+        },
+        "write_amp": {
+          "values": [
+            1.0002691000659898,
+            1.0002691000659898,
+            1.0002691000659898
+          ],
+          "median": 1.0002691000659898,
+          "min": 1.0002691000659898,
+          "max": 1.0002691000659898
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002454668246885,
+            1.0002454668246885,
+            1.0002454668246885
+          ],
+          "median": 1.0002454668246885,
+          "min": 1.0002454668246885,
+          "max": 1.0002454668246885
+        }
+      },
+      "final": {
+        "plaintext_mib_s": {
+          "values": [
+            190.8555768538096,
+            285.5264661372506,
+            274.5142250923055
+          ],
+          "median": 274.5142250923055,
+          "min": 190.8555768538096,
+          "max": 285.5264661372506
+        },
+        "elapsed_ms": {
+          "values": [
+            2682.656782,
+            1793.1788060000001,
+            1865.1128460000002
+          ],
+          "median": 1865.1128460000002,
+          "min": 1793.1788060000001,
+          "max": 2682.656782
+        },
+        "peak_rss_bytes": {
+          "values": [
+            450424832,
+            447893504,
+            452554752
+          ],
+          "median": 450424832,
+          "min": 447893504,
+          "max": 452554752
+        },
+        "write_amp": {
+          "values": [
+            1.0002685785253558,
+            1.0002685785253558,
+            1.0002685785253558
+          ],
+          "median": 1.0002685785253558,
+          "min": 1.0002685785253558,
+          "max": 1.0002685785253558
+        },
+        "verification_read_amp": {
+          "values": [
+            1.0002443939410985,
+            1.0002443939410985,
+            1.0002443939410985
+          ],
+          "median": 1.0002443939410985,
+          "min": 1.0002443939410985,
+          "max": 1.0002443939410985
+        }
+      }
+    }
+  },
+  "kopia": {
+    "baseline": {
+      "source_revision": "408a3c4247b8a7a200ec8c7f7a832c4d23200359",
+      "summary_sha256": "a067d6b0ba01140bf29e21918ed1677b485a28e8b7a3915b381acfe16a24c58c",
+      "budget_checks": {
+        "failed": [],
+        "passed": 60,
+        "total": 60
+      },
+      "content_checks": {
+        "passed": 60,
+        "total": 60
+      },
+      "profiles": {
+        "kubernetes-objects": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 1010,
+                "mean": 988,
+                "median": 991,
+                "min": 963,
+                "values": [
+                  991,
+                  963,
+                  1010
+                ]
+              },
+              "elapsed_ms": {
+                "max": 9463,
+                "mean": 9386.666666666666,
+                "median": 9368,
+                "min": 9329,
+                "values": [
+                  9463,
+                  9329,
+                  9368
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 34468383,
+                "mean": 34468381.333333336,
+                "median": 34468383,
+                "min": 34468378,
+                "values": [
+                  34468383,
+                  34468378,
+                  34468383
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 34664402,
+                "mean": 34664382.666666664,
+                "median": 34664384,
+                "min": 34664362,
+                "values": [
+                  34664362,
+                  34664402,
+                  34664384
+                ]
+              },
+              "provider_requests": {
+                "max": 1616,
+                "mean": 1616,
+                "median": 1616,
+                "min": 1616,
+                "values": [
+                  1616,
+                  1616,
+                  1616
+                ]
+              },
+              "repository_create_ms": {
+                "max": 497,
+                "mean": 494,
+                "median": 495,
+                "min": 490,
+                "values": [
+                  495,
+                  490,
+                  497
+                ]
+              },
+              "restore_ms": {
+                "max": 7953,
+                "mean": 7878.666666666667,
+                "median": 7852,
+                "min": 7831,
+                "values": [
+                  7953,
+                  7852,
+                  7831
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 924,
+                "mean": 913.3333333333334,
+                "median": 911,
+                "min": 905,
+                "values": [
+                  905,
+                  924,
+                  911
+                ]
+              },
+              "elapsed_ms": {
+                "max": 2187,
+                "mean": 2127.6666666666665,
+                "median": 2099,
+                "min": 2097,
+                "values": [
+                  2097,
+                  2099,
+                  2187
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 35038760,
+                "mean": 34951357,
+                "median": 34907656,
+                "min": 34907655,
+                "values": [
+                  34907655,
+                  35038760,
+                  34907656
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 34657159,
+                "mean": 34657005,
+                "median": 34656932,
+                "min": 34656924,
+                "values": [
+                  34656924,
+                  34657159,
+                  34656932
+                ]
+              },
+              "provider_requests": {
+                "max": 97,
+                "mean": 96.33333333333333,
+                "median": 96,
+                "min": 96,
+                "values": [
+                  96,
+                  97,
+                  96
+                ]
+              },
+              "repository_create_ms": {
+                "max": 451,
+                "mean": 445.6666666666667,
+                "median": 444,
+                "min": 442,
+                "values": [
+                  442,
+                  444,
+                  451
+                ]
+              },
+              "restore_ms": {
+                "max": 801,
+                "mean": 744,
+                "median": 725,
+                "min": 706,
+                "values": [
+                  725,
+                  706,
+                  801
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 135380992,
+                "mean": 133204650.66666667,
+                "median": 133435392,
+                "min": 130797568,
+                "values": [
+                  133435392,
+                  135380992,
+                  130797568
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 135380992,
+                "mean": 133204650.66666667,
+                "median": 133435392,
+                "min": 130797568,
+                "values": [
+                  133435392,
+                  135380992,
+                  130797568
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 0.23345431255337318,
+            "mean": 0.22668384939931932,
+            "median": 0.22499732018437132,
+            "min": 0.22159991546021346,
+            "values": [
+              0.22159991546021346,
+              0.22499732018437132,
+              0.23345431255337318
+            ]
+          }
+        },
+        "kubernetes-objects-large": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 1677,
+                "mean": 1533,
+                "median": 1603,
+                "min": 1319,
+                "values": [
+                  1603,
+                  1677,
+                  1319
+                ]
+              },
+              "elapsed_ms": {
+                "max": 33808,
+                "mean": 33713,
+                "median": 33806,
+                "min": 33525,
+                "values": [
+                  33808,
+                  33806,
+                  33525
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 137776276,
+                "mean": 137776275.33333334,
+                "median": 137776275,
+                "min": 137776275,
+                "values": [
+                  137776275,
+                  137776276,
+                  137776275
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 138554637,
+                "mean": 138549764.66666666,
+                "median": 138551420,
+                "min": 138543237,
+                "values": [
+                  138551420,
+                  138554637,
+                  138543237
+                ]
+              },
+              "provider_requests": {
+                "max": 6250,
+                "mean": 6249.666666666667,
+                "median": 6250,
+                "min": 6249,
+                "values": [
+                  6250,
+                  6250,
+                  6249
+                ]
+              },
+              "repository_create_ms": {
+                "max": 690,
+                "mean": 550.3333333333334,
+                "median": 517,
+                "min": 444,
+                "values": [
+                  690,
+                  517,
+                  444
+                ]
+              },
+              "restore_ms": {
+                "max": 31663,
+                "mean": 31537.666666666668,
+                "median": 31523,
+                "min": 31427,
+                "values": [
+                  31427,
+                  31523,
+                  31663
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                },
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                },
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 2162,
+                "mean": 1988.3333333333333,
+                "median": 1907,
+                "min": 1896,
+                "values": [
+                  1907,
+                  1896,
+                  2162
+                ]
+              },
+              "elapsed_ms": {
+                "max": 8198,
+                "mean": 8012,
+                "median": 7924,
+                "min": 7914,
+                "values": [
+                  7924,
+                  7914,
+                  8198
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 139315736,
+                "mean": 139228333.33333334,
+                "median": 139250184,
+                "min": 139119080,
+                "values": [
+                  139315736,
+                  139250184,
+                  139119080
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 138438240,
+                "mean": 138435217,
+                "median": 138433725,
+                "min": 138433686,
+                "values": [
+                  138433686,
+                  138438240,
+                  138433725
+                ]
+              },
+              "provider_requests": {
+                "max": 168,
+                "mean": 166,
+                "median": 165,
+                "min": 165,
+                "values": [
+                  168,
+                  165,
+                  165
+                ]
+              },
+              "repository_create_ms": {
+                "max": 451,
+                "mean": 448,
+                "median": 447,
+                "min": 446,
+                "values": [
+                  447,
+                  446,
+                  451
+                ]
+              },
+              "restore_ms": {
+                "max": 5501,
+                "mean": 5489.333333333333,
+                "median": 5485,
+                "min": 5482,
+                "values": [
+                  5485,
+                  5482,
+                  5501
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                },
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                },
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 272420864,
+                "mean": 270457514.6666667,
+                "median": 272388096,
+                "min": 266563584,
+                "values": [
+                  272420864,
+                  266563584,
+                  272388096
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 272420864,
+                "mean": 265251498.66666666,
+                "median": 269713408,
+                "min": 253620224,
+                "values": [
+                  272420864,
+                  253620224,
+                  269713408
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 0.24453392990305742,
+            "mean": 0.23767226004765782,
+            "median": 0.2343823946994794,
+            "min": 0.2341004555404366,
+            "values": [
+              0.2343823946994794,
+              0.2341004555404366,
+              0.24453392990305742
+            ]
+          }
+        },
+        "medium-restore": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 982,
+                "mean": 881.3333333333334,
+                "median": 852,
+                "min": 810,
+                "values": [
+                  810,
+                  982,
+                  852
+                ]
+              },
+              "elapsed_ms": {
+                "max": 2056,
+                "mean": 2014,
+                "median": 2012,
+                "min": 1974,
+                "values": [
+                  2012,
+                  2056,
+                  1974
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 67137410,
+                "mean": 67137409.66666667,
+                "median": 67137410,
+                "min": 67137409,
+                "values": [
+                  67137410,
+                  67137409,
+                  67137410
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 67241788,
+                "mean": 67241783.66666667,
+                "median": 67241783,
+                "min": 67241780,
+                "values": [
+                  67241780,
+                  67241783,
+                  67241788
+                ]
+              },
+              "provider_requests": {
+                "max": 87,
+                "mean": 87,
+                "median": 87,
+                "min": 87,
+                "values": [
+                  87,
+                  87,
+                  87
+                ]
+              },
+              "repository_create_ms": {
+                "max": 488,
+                "mean": 476.3333333333333,
+                "median": 487,
+                "min": 454,
+                "values": [
+                  488,
+                  487,
+                  454
+                ]
+              },
+              "restore_ms": {
+                "max": 683,
+                "mean": 624,
+                "median": 636,
+                "min": 553,
+                "values": [
+                  683,
+                  553,
+                  636
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                },
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                },
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 1367,
+                "mean": 1228,
+                "median": 1162,
+                "min": 1155,
+                "values": [
+                  1162,
+                  1155,
+                  1367
+                ]
+              },
+              "elapsed_ms": {
+                "max": 2132,
+                "mean": 1998.6666666666667,
+                "median": 1944,
+                "min": 1920,
+                "values": [
+                  1944,
+                  1920,
+                  2132
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 67866308,
+                "mean": 67866307,
+                "median": 67866307,
+                "min": 67866306,
+                "values": [
+                  67866307,
+                  67866306,
+                  67866308
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 67198874,
+                "mean": 67198831.66666667,
+                "median": 67198826,
+                "min": 67198795,
+                "values": [
+                  67198795,
+                  67198826,
+                  67198874
+                ]
+              },
+              "provider_requests": {
+                "max": 92,
+                "mean": 92,
+                "median": 92,
+                "min": 92,
+                "values": [
+                  92,
+                  92,
+                  92
+                ]
+              },
+              "repository_create_ms": {
+                "max": 454,
+                "mean": 448,
+                "median": 448,
+                "min": 442,
+                "values": [
+                  454,
+                  442,
+                  448
+                ]
+              },
+              "restore_ms": {
+                "max": 296,
+                "mean": 291.3333333333333,
+                "median": 292,
+                "min": 286,
+                "values": [
+                  296,
+                  292,
+                  286
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                },
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                },
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 174145536,
+                "mean": 165048320,
+                "median": 164528128,
+                "min": 156471296,
+                "values": [
+                  164528128,
+                  174145536,
+                  156471296
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 174145536,
+                "mean": 161740117.33333334,
+                "median": 164528128,
+                "min": 146546688,
+                "values": [
+                  164528128,
+                  174145536,
+                  146546688
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 1.0800405268490374,
+            "mean": 0.9933651500756857,
+            "median": 0.9662027833001988,
+            "min": 0.933852140077821,
+            "values": [
+              0.9662027833001988,
+              0.933852140077821,
+              1.0800405268490374
+            ]
+          }
+        },
+        "postgres-pgdata": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 1696,
+                "mean": 1307.6666666666667,
+                "median": 1137,
+                "min": 1090,
+                "values": [
+                  1137,
+                  1090,
+                  1696
+                ]
+              },
+              "elapsed_ms": {
+                "max": 2792,
+                "mean": 2398,
+                "median": 2361,
+                "min": 2041,
+                "values": [
+                  2361,
+                  2041,
+                  2792
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 176196557,
+                "mean": 176196557,
+                "median": 176196557,
+                "min": 176196557,
+                "values": [
+                  176196557,
+                  176196557,
+                  176196557
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 176480407,
+                "mean": 176477687.66666666,
+                "median": 176476351,
+                "min": 176476305,
+                "values": [
+                  176476351,
+                  176476305,
+                  176480407
+                ]
+              },
+              "provider_requests": {
+                "max": 193,
+                "mean": 193,
+                "median": 193,
+                "min": 193,
+                "values": [
+                  193,
+                  193,
+                  193
+                ]
+              },
+              "repository_create_ms": {
+                "max": 493,
+                "mean": 475,
+                "median": 489,
+                "min": 443,
+                "values": [
+                  489,
+                  443,
+                  493
+                ]
+              },
+              "restore_ms": {
+                "max": 682,
+                "mean": 574,
+                "median": 569,
+                "min": 471,
+                "values": [
+                  682,
+                  471,
+                  569
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                },
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                },
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 2794,
+                "mean": 2321.6666666666665,
+                "median": 2210,
+                "min": 1961,
+                "values": [
+                  2794,
+                  1961,
+                  2210
+                ]
+              },
+              "elapsed_ms": {
+                "max": 3503,
+                "mean": 3043.3333333333335,
+                "median": 2939,
+                "min": 2688,
+                "values": [
+                  3503,
+                  2688,
+                  2939
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 183262584,
+                "mean": 183262584,
+                "median": 183262584,
+                "min": 183262584,
+                "values": [
+                  183262584,
+                  183262584,
+                  183262584
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 176350471,
+                "mean": 176339469.66666666,
+                "median": 176334015,
+                "min": 176333923,
+                "values": [
+                  176350471,
+                  176333923,
+                  176334015
+                ]
+              },
+              "provider_requests": {
+                "max": 205,
+                "mean": 204,
+                "median": 205,
+                "min": 202,
+                "values": [
+                  202,
+                  205,
+                  205
+                ]
+              },
+              "repository_create_ms": {
+                "max": 447,
+                "mean": 443.3333333333333,
+                "median": 445,
+                "min": 438,
+                "values": [
+                  438,
+                  445,
+                  447
+                ]
+              },
+              "restore_ms": {
+                "max": 251,
+                "mean": 246,
+                "median": 250,
+                "min": 237,
+                "values": [
+                  237,
+                  251,
+                  250
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                },
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                },
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 283455488,
+                "mean": 273959594.6666667,
+                "median": 279138304,
+                "min": 259284992,
+                "values": [
+                  283455488,
+                  279138304,
+                  259284992
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 283455488,
+                "mean": 273959594.6666667,
+                "median": 279138304,
+                "min": 259284992,
+                "values": [
+                  283455488,
+                  279138304,
+                  259284992
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 1.4836933502753071,
+            "mean": 1.284448416647482,
+            "median": 1.317001469867712,
+            "min": 1.052650429799427,
+            "values": [
+              1.4836933502753071,
+              1.317001469867712,
+              1.052650429799427
+            ]
+          }
+        },
+        "postgres-pgdata-large": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 1741,
+                "mean": 1713,
+                "median": 1733,
+                "min": 1665,
+                "values": [
+                  1665,
+                  1741,
+                  1733
+                ]
+              },
+              "elapsed_ms": {
+                "max": 4174,
+                "mean": 3669,
+                "median": 3449,
+                "min": 3384,
+                "values": [
+                  3384,
+                  3449,
+                  4174
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 369142305,
+                "mean": 369142304.6666667,
+                "median": 369142305,
+                "min": 369142304,
+                "values": [
+                  369142305,
+                  369142305,
+                  369142304
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 369731415,
+                "mean": 369731383.6666667,
+                "median": 369731371,
+                "min": 369731365,
+                "values": [
+                  369731371,
+                  369731365,
+                  369731415
+                ]
+              },
+              "provider_requests": {
+                "max": 320,
+                "mean": 320,
+                "median": 320,
+                "min": 320,
+                "values": [
+                  320,
+                  320,
+                  320
+                ]
+              },
+              "repository_create_ms": {
+                "max": 1227,
+                "mean": 722.3333333333334,
+                "median": 493,
+                "min": 447,
+                "values": [
+                  447,
+                  493,
+                  1227
+                ]
+              },
+              "restore_ms": {
+                "max": 1198,
+                "mean": 1143,
+                "median": 1123,
+                "min": 1108,
+                "values": [
+                  1198,
+                  1123,
+                  1108
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 4291,
+                "mean": 3959,
+                "median": 3827,
+                "min": 3759,
+                "values": [
+                  4291,
+                  3759,
+                  3827
+                ]
+              },
+              "elapsed_ms": {
+                "max": 5227,
+                "mean": 4913.333333333333,
+                "median": 4782,
+                "min": 4731,
+                "values": [
+                  5227,
+                  4731,
+                  4782
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 383435294,
+                "mean": 383435293.6666667,
+                "median": 383435294,
+                "min": 383435293,
+                "values": [
+                  383435294,
+                  383435293,
+                  383435294
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 369433728,
+                "mean": 369422612.6666667,
+                "median": 369417134,
+                "min": 369416976,
+                "values": [
+                  369417134,
+                  369433728,
+                  369416976
+                ]
+              },
+              "provider_requests": {
+                "max": 344,
+                "mean": 343,
+                "median": 344,
+                "min": 341,
+                "values": [
+                  344,
+                  341,
+                  344
+                ]
+              },
+              "repository_create_ms": {
+                "max": 452,
+                "mean": 447,
+                "median": 448,
+                "min": 441,
+                "values": [
+                  448,
+                  441,
+                  452
+                ]
+              },
+              "restore_ms": {
+                "max": 420,
+                "mean": 409.6666666666667,
+                "median": 417,
+                "min": 392,
+                "values": [
+                  417,
+                  392,
+                  420
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 435208192,
+                "mean": 405078016,
+                "median": 394878976,
+                "min": 385146880,
+                "values": [
+                  394878976,
+                  385146880,
+                  435208192
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 394878976,
+                "mean": 388474197.3333333,
+                "median": 385396736,
+                "min": 385146880,
+                "values": [
+                  394878976,
+                  385146880,
+                  385396736
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 1.5446217494089836,
+            "mean": 1.3539957746695686,
+            "median": 1.3717019425920556,
+            "min": 1.1456636320076665,
+            "values": [
+              1.5446217494089836,
+              1.3717019425920556,
+              1.1456636320076665
+            ]
+          }
+        }
+      }
+    },
+    "final": {
+      "source_revision": "453c2ff045c07a3361590137b0dbc2ede28b4dd5",
+      "summary_sha256": "3fcb4288a60e88af77e4b871e3b2e80d682a9eeaf74d848a0cbbbf474d59011e",
+      "budget_checks": {
+        "failed": [
+          {
+            "limit": 1.75,
+            "metric": "gateway_vs_direct.elapsed_ms_ratio",
+            "observed": 1.904731173871488,
+            "observed_avg": 1.904731173871488,
+            "operator": "<=",
+            "profile": "postgres-pgdata-large",
+            "reason": null,
+            "status": "fail"
+          }
+        ],
+        "passed": 59,
+        "total": 60
+      },
+      "content_checks": {
+        "passed": 60,
+        "total": 60
+      },
+      "profiles": {
+        "kubernetes-objects": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 1001,
+                "mean": 922.6666666666666,
+                "median": 919,
+                "min": 848,
+                "values": [
+                  848,
+                  1001,
+                  919
+                ]
+              },
+              "elapsed_ms": {
+                "max": 9348,
+                "mean": 9270.333333333334,
+                "median": 9249,
+                "min": 9214,
+                "values": [
+                  9214,
+                  9348,
+                  9249
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 34468383,
+                "mean": 34468382.666666664,
+                "median": 34468383,
+                "min": 34468382,
+                "values": [
+                  34468383,
+                  34468383,
+                  34468382
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 34664557,
+                "mean": 34664497,
+                "median": 34664544,
+                "min": 34664390,
+                "values": [
+                  34664557,
+                  34664544,
+                  34664390
+                ]
+              },
+              "provider_requests": {
+                "max": 1616,
+                "mean": 1616,
+                "median": 1616,
+                "min": 1616,
+                "values": [
+                  1616,
+                  1616,
+                  1616
+                ]
+              },
+              "repository_create_ms": {
+                "max": 491,
+                "mean": 475,
+                "median": 479,
+                "min": 455,
+                "values": [
+                  479,
+                  455,
+                  491
+                ]
+              },
+              "restore_ms": {
+                "max": 7868,
+                "mean": 7849,
+                "median": 7863,
+                "min": 7816,
+                "values": [
+                  7863,
+                  7868,
+                  7816
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 1007,
+                "mean": 956,
+                "median": 950,
+                "min": 911,
+                "values": [
+                  911,
+                  1007,
+                  950
+                ]
+              },
+              "elapsed_ms": {
+                "max": 2258,
+                "mean": 2212.6666666666665,
+                "median": 2250,
+                "min": 2130,
+                "values": [
+                  2130,
+                  2258,
+                  2250
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 34973208,
+                "mean": 34929505.333333336,
+                "median": 34907656,
+                "min": 34907652,
+                "values": [
+                  34907656,
+                  34907652,
+                  34973208
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 34657542,
+                "mean": 34657506,
+                "median": 34657528,
+                "min": 34657448,
+                "values": [
+                  34657542,
+                  34657528,
+                  34657448
+                ]
+              },
+              "provider_requests": {
+                "max": 96,
+                "mean": 96,
+                "median": 96,
+                "min": 96,
+                "values": [
+                  96,
+                  96,
+                  96
+                ]
+              },
+              "repository_create_ms": {
+                "max": 446,
+                "mean": 442.3333333333333,
+                "median": 445,
+                "min": 436,
+                "values": [
+                  436,
+                  445,
+                  446
+                ]
+              },
+              "restore_ms": {
+                "max": 829,
+                "mean": 790.3333333333334,
+                "median": 783,
+                "min": 759,
+                "values": [
+                  759,
+                  783,
+                  829
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 34355307,
+                  "directories": 18,
+                  "files": 1539,
+                  "largest_file_bytes": 33554432
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 150966272,
+                "mean": 140009472,
+                "median": 140455936,
+                "min": 128606208,
+                "values": [
+                  128606208,
+                  140455936,
+                  150966272
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 150966272,
+                "mean": 140009472,
+                "median": 140455936,
+                "min": 128606208,
+                "values": [
+                  128606208,
+                  140455936,
+                  150966272
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 0.2432695426532598,
+            "mean": 0.23866283194966123,
+            "median": 0.2415489944373128,
+            "min": 0.23116995875841112,
+            "values": [
+              0.23116995875841112,
+              0.2415489944373128,
+              0.2432695426532598
+            ]
+          }
+        },
+        "kubernetes-objects-large": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 1300,
+                "mean": 1264.6666666666667,
+                "median": 1277,
+                "min": 1217,
+                "values": [
+                  1277,
+                  1217,
+                  1300
+                ]
+              },
+              "elapsed_ms": {
+                "max": 33495,
+                "mean": 33297.333333333336,
+                "median": 33249,
+                "min": 33148,
+                "values": [
+                  33495,
+                  33148,
+                  33249
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 137776276,
+                "mean": 137776276,
+                "median": 137776276,
+                "min": 137776276,
+                "values": [
+                  137776276,
+                  137776276,
+                  137776276
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 138556277,
+                "mean": 138551794,
+                "median": 138555902,
+                "min": 138543203,
+                "values": [
+                  138543203,
+                  138556277,
+                  138555902
+                ]
+              },
+              "provider_requests": {
+                "max": 6250,
+                "mean": 6249.666666666667,
+                "median": 6250,
+                "min": 6249,
+                "values": [
+                  6249,
+                  6250,
+                  6250
+                ]
+              },
+              "repository_create_ms": {
+                "max": 534,
+                "mean": 501.6666666666667,
+                "median": 528,
+                "min": 443,
+                "values": [
+                  528,
+                  443,
+                  534
+                ]
+              },
+              "restore_ms": {
+                "max": 31589,
+                "mean": 31428,
+                "median": 31389,
+                "min": 31306,
+                "values": [
+                  31589,
+                  31389,
+                  31306
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                },
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                },
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 2076,
+                "mean": 2071.3333333333335,
+                "median": 2071,
+                "min": 2067,
+                "values": [
+                  2071,
+                  2067,
+                  2076
+                ]
+              },
+              "elapsed_ms": {
+                "max": 8130,
+                "mean": 8113,
+                "median": 8129,
+                "min": 8080,
+                "values": [
+                  8080,
+                  8129,
+                  8130
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 139512389,
+                "mean": 139272033.66666666,
+                "median": 139184632,
+                "min": 139119080,
+                "values": [
+                  139119080,
+                  139184632,
+                  139512389
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 138439631,
+                "mean": 138436674.33333334,
+                "median": 138435267,
+                "min": 138435125,
+                "values": [
+                  138439631,
+                  138435125,
+                  138435267
+                ]
+              },
+              "provider_requests": {
+                "max": 168,
+                "mean": 167,
+                "median": 167,
+                "min": 166,
+                "values": [
+                  166,
+                  167,
+                  168
+                ]
+              },
+              "repository_create_ms": {
+                "max": 451,
+                "mean": 448.6666666666667,
+                "median": 450,
+                "min": 445,
+                "values": [
+                  451,
+                  445,
+                  450
+                ]
+              },
+              "restore_ms": {
+                "max": 5526,
+                "mean": 5503.333333333333,
+                "median": 5516,
+                "min": 5468,
+                "values": [
+                  5468,
+                  5526,
+                  5516
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                },
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                },
+                {
+                  "bytes": 137413483,
+                  "directories": 50,
+                  "files": 6147,
+                  "largest_file_bytes": 134217728
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 260005888,
+                "mean": 253904213.33333334,
+                "median": 259076096,
+                "min": 242630656,
+                "values": [
+                  259076096,
+                  242630656,
+                  260005888
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 260005888,
+                "mean": 253689856,
+                "median": 258433024,
+                "min": 242630656,
+                "values": [
+                  258433024,
+                  242630656,
+                  260005888
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 0.24523349825027152,
+            "mean": 0.24366072157435553,
+            "median": 0.24451863213931246,
+            "min": 0.2412300343334826,
+            "values": [
+              0.2412300343334826,
+              0.24523349825027152,
+              0.24451863213931246
+            ]
+          }
+        },
+        "medium-restore": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 928,
+                "mean": 893.6666666666666,
+                "median": 890,
+                "min": 863,
+                "values": [
+                  863,
+                  928,
+                  890
+                ]
+              },
+              "elapsed_ms": {
+                "max": 2073,
+                "mean": 2026.3333333333333,
+                "median": 2061,
+                "min": 1945,
+                "values": [
+                  2061,
+                  1945,
+                  2073
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 67137410,
+                "mean": 67137409.33333333,
+                "median": 67137410,
+                "min": 67137408,
+                "values": [
+                  67137408,
+                  67137410,
+                  67137410
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 67241784,
+                "mean": 67241778.66666667,
+                "median": 67241780,
+                "min": 67241772,
+                "values": [
+                  67241784,
+                  67241772,
+                  67241780
+                ]
+              },
+              "provider_requests": {
+                "max": 87,
+                "mean": 87,
+                "median": 87,
+                "min": 87,
+                "values": [
+                  87,
+                  87,
+                  87
+                ]
+              },
+              "repository_create_ms": {
+                "max": 538,
+                "mean": 498,
+                "median": 480,
+                "min": 476,
+                "values": [
+                  538,
+                  480,
+                  476
+                ]
+              },
+              "restore_ms": {
+                "max": 677,
+                "mean": 605,
+                "median": 631,
+                "min": 507,
+                "values": [
+                  631,
+                  507,
+                  677
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                },
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                },
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 1222,
+                "mean": 1218.3333333333333,
+                "median": 1220,
+                "min": 1213,
+                "values": [
+                  1220,
+                  1222,
+                  1213
+                ]
+              },
+              "elapsed_ms": {
+                "max": 1969,
+                "mean": 1967,
+                "median": 1969,
+                "min": 1963,
+                "values": [
+                  1969,
+                  1969,
+                  1963
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 67866308,
+                "mean": 67866308,
+                "median": 67866308,
+                "min": 67866308,
+                "values": [
+                  67866308,
+                  67866308,
+                  67866308
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 67199382,
+                "mean": 67199365.66666667,
+                "median": 67199367,
+                "min": 67199348,
+                "values": [
+                  67199348,
+                  67199382,
+                  67199367
+                ]
+              },
+              "provider_requests": {
+                "max": 92,
+                "mean": 92,
+                "median": 92,
+                "min": 92,
+                "values": [
+                  92,
+                  92,
+                  92
+                ]
+              },
+              "repository_create_ms": {
+                "max": 444,
+                "mean": 440.3333333333333,
+                "median": 441,
+                "min": 436,
+                "values": [
+                  441,
+                  436,
+                  444
+                ]
+              },
+              "restore_ms": {
+                "max": 283,
+                "mean": 280.6666666666667,
+                "median": 280,
+                "min": 279,
+                "values": [
+                  280,
+                  283,
+                  279
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                },
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                },
+                {
+                  "bytes": 67108875,
+                  "directories": 1,
+                  "files": 3,
+                  "largest_file_bytes": 67108864
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 177217536,
+                "mean": 171678378.66666666,
+                "median": 169664512,
+                "min": 168153088,
+                "values": [
+                  177217536,
+                  168153088,
+                  169664512
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 173268992,
+                "mean": 170362197.33333334,
+                "median": 169664512,
+                "min": 168153088,
+                "values": [
+                  173268992,
+                  168153088,
+                  169664512
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 1.0123393316195373,
+            "mean": 0.9715458710640692,
+            "median": 0.95536147501213,
+            "min": 0.9469368065605402,
+            "values": [
+              0.95536147501213,
+              1.0123393316195373,
+              0.9469368065605402
+            ]
+          }
+        },
+        "postgres-pgdata": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 1284,
+                "mean": 1187.6666666666667,
+                "median": 1147,
+                "min": 1132,
+                "values": [
+                  1147,
+                  1132,
+                  1284
+                ]
+              },
+              "elapsed_ms": {
+                "max": 2312,
+                "mean": 2225.6666666666665,
+                "median": 2236,
+                "min": 2129,
+                "values": [
+                  2129,
+                  2236,
+                  2312
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 176196557,
+                "mean": 176196557,
+                "median": 176196557,
+                "min": 176196557,
+                "values": [
+                  176196557,
+                  176196557,
+                  176196557
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 176476343,
+                "mean": 176476322,
+                "median": 176476320,
+                "min": 176476303,
+                "values": [
+                  176476343,
+                  176476303,
+                  176476320
+                ]
+              },
+              "provider_requests": {
+                "max": 193,
+                "mean": 193,
+                "median": 193,
+                "min": 193,
+                "values": [
+                  193,
+                  193,
+                  193
+                ]
+              },
+              "repository_create_ms": {
+                "max": 554,
+                "mean": 510.6666666666667,
+                "median": 494,
+                "min": 484,
+                "values": [
+                  484,
+                  554,
+                  494
+                ]
+              },
+              "restore_ms": {
+                "max": 516,
+                "mean": 486,
+                "median": 499,
+                "min": 443,
+                "values": [
+                  443,
+                  516,
+                  499
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                },
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                },
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 3660,
+                "mean": 3094,
+                "median": 2985,
+                "min": 2637,
+                "values": [
+                  2985,
+                  2637,
+                  3660
+                ]
+              },
+              "elapsed_ms": {
+                "max": 4416,
+                "mean": 3842,
+                "median": 3715,
+                "min": 3395,
+                "values": [
+                  3715,
+                  3395,
+                  4416
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 183262586,
+                "mean": 183262586,
+                "median": 183262586,
+                "min": 183262586,
+                "values": [
+                  183262586,
+                  183262586,
+                  183262586
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 176318169,
+                "mean": 176318113.33333334,
+                "median": 176318086,
+                "min": 176318085,
+                "values": [
+                  176318086,
+                  176318085,
+                  176318169
+                ]
+              },
+              "provider_requests": {
+                "max": 208,
+                "mean": 208,
+                "median": 208,
+                "min": 208,
+                "values": [
+                  208,
+                  208,
+                  208
+                ]
+              },
+              "repository_create_ms": {
+                "max": 449,
+                "mean": 445,
+                "median": 445,
+                "min": 441,
+                "values": [
+                  441,
+                  449,
+                  445
+                ]
+              },
+              "restore_ms": {
+                "max": 273,
+                "mean": 259.3333333333333,
+                "median": 257,
+                "min": 248,
+                "values": [
+                  257,
+                  273,
+                  248
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                },
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                },
+                {
+                  "bytes": 176160782,
+                  "directories": 5,
+                  "files": 104,
+                  "largest_file_bytes": 16777216
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 336257024,
+                "mean": 305224362.6666667,
+                "median": 297697280,
+                "min": 281718784,
+                "values": [
+                  297697280,
+                  281718784,
+                  336257024
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 297697280,
+                "mean": 292057088,
+                "median": 296755200,
+                "min": 281718784,
+                "values": [
+                  297697280,
+                  281718784,
+                  296755200
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 1.9100346020761245,
+            "mean": 1.7244405326649974,
+            "median": 1.7449506810709252,
+            "min": 1.5183363148479427,
+            "values": [
+              1.7449506810709252,
+              1.5183363148479427,
+              1.9100346020761245
+            ]
+          }
+        },
+        "postgres-pgdata-large": {
+          "run_order": [
+            [
+              "direct-rustfs",
+              "gateway"
+            ],
+            [
+              "gateway",
+              "direct-rustfs"
+            ],
+            [
+              "direct-rustfs",
+              "gateway"
+            ]
+          ],
+          "storage_paths": {
+            "direct-rustfs": {
+              "backup_ms": {
+                "max": 1749,
+                "mean": 1730.6666666666667,
+                "median": 1740,
+                "min": 1703,
+                "values": [
+                  1749,
+                  1740,
+                  1703
+                ]
+              },
+              "elapsed_ms": {
+                "max": 3499,
+                "mean": 3436.6666666666665,
+                "median": 3461,
+                "min": 3350,
+                "values": [
+                  3461,
+                  3499,
+                  3350
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 369142305,
+                "mean": 369142303,
+                "median": 369142305,
+                "min": 369142299,
+                "values": [
+                  369142305,
+                  369142305,
+                  369142299
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 369731372,
+                "mean": 369729974,
+                "median": 369731353,
+                "min": 369727197,
+                "values": [
+                  369727197,
+                  369731372,
+                  369731353
+                ]
+              },
+              "provider_requests": {
+                "max": 320,
+                "mean": 320,
+                "median": 320,
+                "min": 320,
+                "values": [
+                  320,
+                  320,
+                  320
+                ]
+              },
+              "repository_create_ms": {
+                "max": 532,
+                "mean": 512.3333333333334,
+                "median": 512,
+                "min": 493,
+                "values": [
+                  532,
+                  493,
+                  512
+                ]
+              },
+              "restore_ms": {
+                "max": 1138,
+                "mean": 1074.6666666666667,
+                "median": 1062,
+                "min": 1024,
+                "values": [
+                  1062,
+                  1138,
+                  1024
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                }
+              ]
+            },
+            "gateway": {
+              "backup_ms": {
+                "max": 5607,
+                "mean": 5542.666666666667,
+                "median": 5545,
+                "min": 5476,
+                "values": [
+                  5607,
+                  5476,
+                  5545
+                ]
+              },
+              "elapsed_ms": {
+                "max": 6650,
+                "mean": 6543.666666666667,
+                "median": 6519,
+                "min": 6462,
+                "values": [
+                  6650,
+                  6462,
+                  6519
+                ]
+              },
+              "provider_bytes_read": {
+                "max": 383435288,
+                "mean": 383432798,
+                "median": 383431553,
+                "min": 383431553,
+                "values": [
+                  383431553,
+                  383435288,
+                  383431553
+                ]
+              },
+              "provider_bytes_written": {
+                "max": 369368498,
+                "mean": 369365749.3333333,
+                "median": 369364384,
+                "min": 369364366,
+                "values": [
+                  369364384,
+                  369368498,
+                  369364366
+                ]
+              },
+              "provider_requests": {
+                "max": 353,
+                "mean": 353,
+                "median": 353,
+                "min": 353,
+                "values": [
+                  353,
+                  353,
+                  353
+                ]
+              },
+              "repository_create_ms": {
+                "max": 450,
+                "mean": 445,
+                "median": 445,
+                "min": 440,
+                "values": [
+                  450,
+                  440,
+                  445
+                ]
+              },
+              "restore_ms": {
+                "max": 469,
+                "mean": 435.6666666666667,
+                "median": 425,
+                "min": 413,
+                "values": [
+                  469,
+                  425,
+                  413
+                ]
+              },
+              "source_tree_per_run": [
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                },
+                {
+                  "bytes": 369098766,
+                  "directories": 5,
+                  "files": 204,
+                  "largest_file_bytes": 33554432
+                }
+              ],
+              "vm_hwm_bytes": {
+                "max": 451518464,
+                "mean": 422136490.6666667,
+                "median": 413487104,
+                "min": 401403904,
+                "values": [
+                  413487104,
+                  401403904,
+                  451518464
+                ]
+              },
+              "vm_rss_bytes": {
+                "max": 451518464,
+                "mean": 422136490.6666667,
+                "median": 413487104,
+                "min": 401403904,
+                "values": [
+                  413487104,
+                  401403904,
+                  451518464
+                ]
+              }
+            }
+          },
+          "within_revision_gateway_over_direct_elapsed_ratio": {
+            "max": 1.9459701492537314,
+            "mean": 1.9047311738714883,
+            "median": 1.9214099971106617,
+            "min": 1.8468133752500715,
+            "values": [
+              1.9214099971106617,
+              1.8468133752500715,
+              1.9459701492537314
+            ]
+          }
+        }
+      }
+    }
+  },
+  "local_inputs": {
+    "scale-10k": {
+      "objects": 10000,
+      "object_size": 512,
+      "logical_path_len": 45,
+      "commit": {
+        "batch_delay_ms": 10,
+        "batch_items": 64,
+        "concurrency": 64,
+        "max_pending_items": 64
+      }
+    },
+    "compaction": {
+      "objects": 10000,
+      "object_size": 1024,
+      "logical_path_len": 45,
+      "commit": {
+        "batch_delay_ms": 10,
+        "batch_items": 16,
+        "concurrency": 16,
+        "max_pending_items": 16
+      }
+    },
+    "path-32": {
+      "objects": 10000,
+      "object_size": 512,
+      "logical_path_len": 32,
+      "commit": {
+        "batch_delay_ms": 10,
+        "batch_items": 64,
+        "concurrency": 64,
+        "max_pending_items": 64
+      }
+    },
+    "path-256": {
+      "objects": 10000,
+      "object_size": 512,
+      "logical_path_len": 256,
+      "commit": {
+        "batch_delay_ms": 10,
+        "batch_items": 64,
+        "concurrency": 64,
+        "max_pending_items": 64
+      }
+    },
+    "path-1024": {
+      "objects": 10000,
+      "object_size": 512,
+      "logical_path_len": 1024,
+      "commit": {
+        "batch_delay_ms": 10,
+        "batch_items": 64,
+        "concurrency": 64,
+        "max_pending_items": 64
+      }
+    },
+    "scale-1m": {
+      "objects": 1000000,
+      "object_size": 512,
+      "logical_path_len": 45,
+      "commit": {
+        "batch_delay_ms": 10,
+        "batch_items": 4096,
+        "concurrency": 4096,
+        "max_pending_items": 4096
+      }
+    },
+    "fs-1m": {
+      "objects": 1000000,
+      "object_size": 512,
+      "logical_path_len": 45
+    }
+  },
+  "local": {
+    "scale-10k": {
+      "baseline": {
+        "elapsed_ms": {
+          "values": [
+            114.343854,
+            116.68717500000001,
+            116.35007999999999
+          ],
+          "median": 116.35007999999999,
+          "min": 114.343854,
+          "max": 116.68717500000001
+        },
+        "bytes_written": {
+          "values": [
+            6736983,
+            6736983,
+            6736983
+          ],
+          "median": 6736983,
+          "min": 6736983,
+          "max": 6736983
+        },
+        "peak_rss_bytes": {
+          "values": [
+            31629312,
+            31633408,
+            31629312
+          ],
+          "median": 31629312,
+          "min": 31629312,
+          "max": 31633408
+        },
+        "provider_requests": {
+          "values": [
+            483,
+            483,
+            483
+          ],
+          "median": 483,
+          "min": 483,
+          "max": 483
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            157,
+            157,
+            157
+          ],
+          "median": 157,
+          "min": 157,
+          "max": 157
+        }
+      },
+      "final": {
+        "elapsed_ms": {
+          "values": [
+            133.09867,
+            135.475077,
+            133.052542
+          ],
+          "median": 133.09867,
+          "min": 133.052542,
+          "max": 135.475077
+        },
+        "bytes_written": {
+          "values": [
+            6516406,
+            6516406,
+            6516406
+          ],
+          "median": 6516406,
+          "min": 6516406,
+          "max": 6516406
+        },
+        "peak_rss_bytes": {
+          "values": [
+            34791424,
+            34623488,
+            35196928
+          ],
+          "median": 34791424,
+          "min": 34623488,
+          "max": 35196928
+        },
+        "provider_requests": {
+          "values": [
+            478,
+            478,
+            478
+          ],
+          "median": 478,
+          "min": 478,
+          "max": 478
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            157,
+            157,
+            157
+          ],
+          "median": 157,
+          "min": 157,
+          "max": 157
+        }
+      }
+    },
+    "compaction": {
+      "baseline": {
+        "elapsed_ms": {
+          "values": [
+            189.43124,
+            189.97627,
+            189.02577100000002
+          ],
+          "median": 189.43124,
+          "min": 189.02577100000002,
+          "max": 189.97627
+        },
+        "bytes_written": {
+          "values": [
+            13579875,
+            13579875,
+            13579875
+          ],
+          "median": 13579875,
+          "min": 13579875,
+          "max": 13579875
+        },
+        "peak_rss_bytes": {
+          "values": [
+            48574464,
+            48553984,
+            48590848
+          ],
+          "median": 48574464,
+          "min": 48553984,
+          "max": 48590848
+        },
+        "provider_requests": {
+          "values": [
+            3480,
+            3480,
+            3480
+          ],
+          "median": 3480,
+          "min": 3480,
+          "max": 3480
+        },
+        "observed_compactions": {
+          "values": [
+            3,
+            3,
+            3
+          ],
+          "median": 3,
+          "min": 3,
+          "max": 3
+        },
+        "active_index_runs": {
+          "values": [
+            244,
+            244,
+            244
+          ],
+          "median": 244,
+          "min": 244,
+          "max": 244
+        }
+      },
+      "final": {
+        "elapsed_ms": {
+          "values": [
+            215.27693,
+            217.109953,
+            218.300039
+          ],
+          "median": 217.109953,
+          "min": 215.27693,
+          "max": 218.300039
+        },
+        "bytes_written": {
+          "values": [
+            13230799,
+            13230799,
+            13230799
+          ],
+          "median": 13230799,
+          "min": 13230799,
+          "max": 13230799
+        },
+        "peak_rss_bytes": {
+          "values": [
+            52514816,
+            52555776,
+            52469760
+          ],
+          "median": 52514816,
+          "min": 52469760,
+          "max": 52555776
+        },
+        "provider_requests": {
+          "values": [
+            3460,
+            3460,
+            3460
+          ],
+          "median": 3460,
+          "min": 3460,
+          "max": 3460
+        },
+        "observed_compactions": {
+          "values": [
+            3,
+            3,
+            3
+          ],
+          "median": 3,
+          "min": 3,
+          "max": 3
+        },
+        "active_index_runs": {
+          "values": [
+            244,
+            244,
+            244
+          ],
+          "median": 244,
+          "min": 244,
+          "max": 244
+        }
+      }
+    },
+    "path-32": {
+      "baseline": {
+        "elapsed_ms": {
+          "values": [
+            115.753703,
+            113.85820000000001,
+            115.509119
+          ],
+          "median": 115.509119,
+          "min": 113.85820000000001,
+          "max": 115.753703
+        },
+        "bytes_written": {
+          "values": [
+            6598819,
+            6598819,
+            6598819
+          ],
+          "median": 6598819,
+          "min": 6598819,
+          "max": 6598819
+        },
+        "peak_rss_bytes": {
+          "values": [
+            31227904,
+            31281152,
+            31232000
+          ],
+          "median": 31232000,
+          "min": 31227904,
+          "max": 31281152
+        },
+        "provider_requests": {
+          "values": [
+            483,
+            483,
+            483
+          ],
+          "median": 483,
+          "min": 483,
+          "max": 483
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            157,
+            157,
+            157
+          ],
+          "median": 157,
+          "min": 157,
+          "max": 157
+        }
+      },
+      "final": {
+        "elapsed_ms": {
+          "values": [
+            133.158043,
+            130.77561400000002,
+            131.722365
+          ],
+          "median": 131.722365,
+          "min": 130.77561400000002,
+          "max": 133.158043
+        },
+        "bytes_written": {
+          "values": [
+            6506201,
+            6506201,
+            6506201
+          ],
+          "median": 6506201,
+          "min": 6506201,
+          "max": 6506201
+        },
+        "peak_rss_bytes": {
+          "values": [
+            34422784,
+            34418688,
+            34410496
+          ],
+          "median": 34418688,
+          "min": 34410496,
+          "max": 34422784
+        },
+        "provider_requests": {
+          "values": [
+            478,
+            478,
+            478
+          ],
+          "median": 478,
+          "min": 478,
+          "max": 478
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            157,
+            157,
+            157
+          ],
+          "median": 157,
+          "min": 157,
+          "max": 157
+        }
+      }
+    },
+    "path-256": {
+      "baseline": {
+        "elapsed_ms": {
+          "values": [
+            135.61331900000002,
+            129.630799,
+            131.91408299999998
+          ],
+          "median": 131.91408299999998,
+          "min": 129.630799,
+          "max": 135.61331900000002
+        },
+        "bytes_written": {
+          "values": [
+            8999491,
+            8999491,
+            8999491
+          ],
+          "median": 8999491,
+          "min": 8999491,
+          "max": 8999491
+        },
+        "peak_rss_bytes": {
+          "values": [
+            38387712,
+            38391808,
+            38391808
+          ],
+          "median": 38391808,
+          "min": 38387712,
+          "max": 38391808
+        },
+        "provider_requests": {
+          "values": [
+            483,
+            483,
+            483
+          ],
+          "median": 483,
+          "min": 483,
+          "max": 483
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            157,
+            157,
+            157
+          ],
+          "median": 157,
+          "min": 157,
+          "max": 157
+        }
+      },
+      "final": {
+        "elapsed_ms": {
+          "values": [
+            139.878752,
+            140.159883,
+            140.956018
+          ],
+          "median": 140.159883,
+          "min": 139.878752,
+          "max": 140.956018
+        },
+        "bytes_written": {
+          "values": [
+            6692198,
+            6692198,
+            6692198
+          ],
+          "median": 6692198,
+          "min": 6692198,
+          "max": 6692198
+        },
+        "peak_rss_bytes": {
+          "values": [
+            37040128,
+            37031936,
+            37294080
+          ],
+          "median": 37040128,
+          "min": 37031936,
+          "max": 37294080
+        },
+        "provider_requests": {
+          "values": [
+            478,
+            478,
+            478
+          ],
+          "median": 478,
+          "min": 478,
+          "max": 478
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            157,
+            157,
+            157
+          ],
+          "median": 157,
+          "min": 157,
+          "max": 157
+        }
+      }
+    },
+    "path-1024": {
+      "baseline": {
+        "elapsed_ms": {
+          "values": [
+            186.755785,
+            185.840022,
+            184.959285
+          ],
+          "median": 185.840022,
+          "min": 184.959285,
+          "max": 186.755785
+        },
+        "bytes_written": {
+          "values": [
+            17162107,
+            17162107,
+            17162107
+          ],
+          "median": 17162107,
+          "min": 17162107,
+          "max": 17162107
+        },
+        "peak_rss_bytes": {
+          "values": [
+            62767104,
+            62775296,
+            62767104
+          ],
+          "median": 62767104,
+          "min": 62767104,
+          "max": 62775296
+        },
+        "provider_requests": {
+          "values": [
+            483,
+            483,
+            483
+          ],
+          "median": 483,
+          "min": 483,
+          "max": 483
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            157,
+            157,
+            157
+          ],
+          "median": 157,
+          "min": 157,
+          "max": 157
+        }
+      },
+      "final": {
+        "elapsed_ms": {
+          "values": [
+            168.734965,
+            170.448575,
+            169.385997
+          ],
+          "median": 169.385997,
+          "min": 168.734965,
+          "max": 170.448575
+        },
+        "bytes_written": {
+          "values": [
+            7295078,
+            7295078,
+            7295078
+          ],
+          "median": 7295078,
+          "min": 7295078,
+          "max": 7295078
+        },
+        "peak_rss_bytes": {
+          "values": [
+            46231552,
+            46149632,
+            46600192
+          ],
+          "median": 46231552,
+          "min": 46149632,
+          "max": 46600192
+        },
+        "provider_requests": {
+          "values": [
+            478,
+            478,
+            478
+          ],
+          "median": 478,
+          "min": 478,
+          "max": 478
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            157,
+            157,
+            157
+          ],
+          "median": 157,
+          "min": 157,
+          "max": 157
+        }
+      }
+    },
+    "scale-1m": {
+      "baseline": {
+        "elapsed_ms": {
+          "values": [
+            28240.084199999998,
+            28262.395897000002,
+            28392.225499
+          ],
+          "median": 28262.395897000002,
+          "min": 28240.084199999998,
+          "max": 28392.225499
+        },
+        "bytes_written": {
+          "values": [
+            649365727,
+            649365727,
+            649365727
+          ],
+          "median": 649365727,
+          "min": 649365727,
+          "max": 649365727
+        },
+        "peak_rss_bytes": {
+          "values": [
+            1687609344,
+            1687998464,
+            1688023040
+          ],
+          "median": 1687998464,
+          "min": 1687609344,
+          "max": 1688023040
+        },
+        "provider_requests": {
+          "values": [
+            747,
+            747,
+            747
+          ],
+          "median": 747,
+          "min": 747,
+          "max": 747
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            245,
+            245,
+            245
+          ],
+          "median": 245,
+          "min": 245,
+          "max": 245
+        }
+      },
+      "final": {
+        "elapsed_ms": {
+          "values": [
+            31619.555367,
+            31614.080535,
+            31650.71127
+          ],
+          "median": 31619.555367,
+          "min": 31614.080535,
+          "max": 31650.71127
+        },
+        "bytes_written": {
+          "values": [
+            627478470,
+            627478470,
+            627478470
+          ],
+          "median": 627478470,
+          "min": 627478470,
+          "max": 627478470
+        },
+        "peak_rss_bytes": {
+          "values": [
+            1885532160,
+            1885736960,
+            1886183424
+          ],
+          "median": 1885736960,
+          "min": 1885532160,
+          "max": 1886183424
+        },
+        "provider_requests": {
+          "values": [
+            742,
+            742,
+            742
+          ],
+          "median": 742,
+          "min": 742,
+          "max": 742
+        },
+        "observed_compactions": {
+          "values": [
+            0,
+            0,
+            0
+          ],
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "active_index_runs": {
+          "values": [
+            245,
+            245,
+            245
+          ],
+          "median": 245,
+          "min": 245,
+          "max": 245
+        }
+      }
+    },
+    "fs-1m": {
+      "baseline": {
+        "elapsed_ms": {
+          "values": [
+            28963.647987999997,
+            29369.114195,
+            29751.969825
+          ],
+          "median": 29369.114195,
+          "min": 28963.647987999997,
+          "max": 29751.969825
+        },
+        "bytes_written": {
+          "values": [
+            649361531,
+            649361531,
+            649361531
+          ],
+          "median": 649361531,
+          "min": 649361531,
+          "max": 649361531
+        },
+        "peak_rss_bytes": {
+          "values": [
+            962777088,
+            962117632,
+            962277376
+          ],
+          "median": 962277376,
+          "min": 962117632,
+          "max": 962777088
+        },
+        "provider_requests": {
+          "values": [
+            747,
+            747,
+            747
+          ],
+          "median": 747,
+          "min": 747,
+          "max": 747
+        },
+        "recovery_ms": {
+          "values": [
+            3237.808293,
+            3131.33829,
+            3152.632826
+          ],
+          "median": 3152.632826,
+          "min": 3131.33829,
+          "max": 3237.808293
+        },
+        "reader_peak_rss_bytes": {
+          "values": [
+            1015697408,
+            1016324096,
+            1016360960
+          ],
+          "median": 1016324096,
+          "min": 1015697408,
+          "max": 1016360960
+        }
+      },
+      "final": {
+        "elapsed_ms": {
+          "values": [
+            33185.681711,
+            33345.61043,
+            32554.289111
+          ],
+          "median": 33185.681711,
+          "min": 32554.289111,
+          "max": 33345.61043
+        },
+        "bytes_written": {
+          "values": [
+            627474266,
+            627474266,
+            627474266
+          ],
+          "median": 627474266,
+          "min": 627474266,
+          "max": 627474266
+        },
+        "peak_rss_bytes": {
+          "values": [
+            1203302400,
+            1203183616,
+            1203347456
+          ],
+          "median": 1203302400,
+          "min": 1203183616,
+          "max": 1203347456
+        },
+        "provider_requests": {
+          "values": [
+            742,
+            742,
+            742
+          ],
+          "median": 742,
+          "min": 742,
+          "max": 742
+        },
+        "recovery_ms": {
+          "values": [
+            3496.2219299999997,
+            3370.626068,
+            3502.8129099999996
+          ],
+          "median": 3496.2219299999997,
+          "min": 3370.626068,
+          "max": 3502.8129099999996
+        },
+        "reader_peak_rss_bytes": {
+          "values": [
+            1190723584,
+            1191116800,
+            1191116800
+          ],
+          "median": 1191116800,
+          "min": 1190723584,
+          "max": 1191116800
+        }
+      }
+    }
+  },
+  "small": {
+    "empty-64": {
+      "metric": "bytes_per_object",
+      "limit": 320,
+      "passed": true,
+      "values": [
+        105.734375,
+        105.734375,
+        105.734375
+      ],
+      "median": 105.734375,
+      "min": 105.734375,
+      "max": 105.734375
+    },
+    "batch-4k-64": {
+      "metric": "write_amp",
+      "limit": 1.15,
+      "passed": true,
+      "values": [
+        1.0316734313964844,
+        1.0316734313964844,
+        1.0316734313964844
+      ],
+      "median": 1.0316734313964844,
+      "min": 1.0316734313964844,
+      "max": 1.0316734313964844
+    },
+    "batch-256k-64": {
+      "metric": "write_amp",
+      "limit": 1.03,
+      "passed": true,
+      "values": [
+        1.000689148902893,
+        1.000689148902893,
+        1.000689148902893
+      ],
+      "median": 1.000689148902893,
+      "min": 1.000689148902893,
+      "max": 1.000689148902893
+    },
+    "sequential-512-64": {
+      "metric": "write_amp",
+      "limit": 3.0,
+      "passed": false,
+      "values": [
+        3.91827392578125,
+        3.91827392578125,
+        3.91827392578125
+      ],
+      "median": 3.91827392578125,
+      "min": 3.91827392578125,
+      "max": 3.91827392578125
+    }
+  }
+}

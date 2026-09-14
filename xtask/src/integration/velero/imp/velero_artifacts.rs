@@ -1,16 +1,31 @@
 //! Artifact and backend-pressure capture for Velero integration lanes.
 
 use super::{RunState, integration_storage_proxy, kubectl_capture};
-use crate::integration::k8s_support::{build_source_revision, helm_fullname, now_millis};
+use crate::integration::k8s_support::{
+    PortForward, build_source_revision, helm_fullname, now_millis,
+};
 use crate::integration::velero::VeleroKopiaSmokeArgs;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rs3_storage::BlobOperationCounts;
 use serde_json::{Value, json};
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const MAX_GATEWAY_PROMETHEUS_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(super) struct ArtifactCollector {
     root: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GatewayMultipartSnapshot {
+    create_requests: u64,
+    upload_requests: u64,
+    complete_requests: u64,
+    upload_bytes: u64,
 }
 
 impl ArtifactCollector {
@@ -45,7 +60,7 @@ impl ArtifactCollector {
                 "source_revision": build_source_revision(),
                 "scenario": state.scenario_label,
                 "storage_path": state.storage_path.as_str(),
-                "repository_format": "v2-preview",
+                "repository_format": "v3-preview",
                 "backup": state.backup_name,
                 "restore": state.restore_name,
                 "elapsed_ms": state.started.elapsed().as_millis(),
@@ -145,6 +160,58 @@ impl ArtifactCollector {
         )?;
 
         eprintln!("Velero integration artifacts written to {}", root.display());
+        Ok(())
+    }
+
+    pub(super) fn capture_gateway_multipart_snapshot(
+        &self,
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+        phase: &str,
+    ) -> Result<GatewayMultipartSnapshot> {
+        let metrics = gateway_prometheus_text(args, kubeconfig_path)?;
+        self.write_text(
+            &format!("gateway-prometheus-{}.prom", sanitize_file_component(phase)),
+            &metrics,
+        )?;
+        parse_gateway_multipart_snapshot(&metrics)
+    }
+
+    pub(super) fn assert_gateway_multipart_qualification(
+        &self,
+        args: &VeleroKopiaSmokeArgs,
+        kubeconfig_path: &Path,
+        before: &GatewayMultipartSnapshot,
+    ) -> Result<()> {
+        let after =
+            self.capture_gateway_multipart_snapshot(args, kubeconfig_path, "after-backup")?;
+        let create_requests = after.create_requests.saturating_sub(before.create_requests);
+        let upload_requests = after.upload_requests.saturating_sub(before.upload_requests);
+        let complete_requests = after
+            .complete_requests
+            .saturating_sub(before.complete_requests);
+        let upload_bytes = after.upload_bytes.saturating_sub(before.upload_bytes);
+        self.write_json(
+            "gateway-client-multipart-qualification.json",
+            json!({
+                "source": "gateway-prometheus-delta",
+                "before": gateway_multipart_snapshot_json(before),
+                "after": gateway_multipart_snapshot_json(&after),
+                "delta": {
+                    "successful_create_requests": create_requests,
+                    "successful_upload_part_requests": upload_requests,
+                    "successful_complete_requests": complete_requests,
+                    "observed_upload_part_bytes": upload_bytes,
+                },
+                "required_upload_part_bytes_exclusive": 5 * 1024 * 1024,
+            }),
+        )?;
+        if create_requests == 0 || upload_requests == 0 || complete_requests == 0 {
+            bail!("Velero backup did not complete the required client multipart request sequence");
+        }
+        if upload_bytes <= 5 * 1024 * 1024 {
+            bail!("Velero backup client multipart archive did not exceed 5 MiB");
+        }
         Ok(())
     }
 
@@ -385,6 +452,166 @@ fn gateway_selector(args: &VeleroKopiaSmokeArgs) -> String {
         "app.kubernetes.io/name=rs3-gateway,app.kubernetes.io/instance={}",
         args.release_name
     )
+}
+
+fn gateway_prometheus_text(args: &VeleroKopiaSmokeArgs, kubeconfig_path: &Path) -> Result<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build runtime for gateway metrics capture")?;
+    let service = helm_fullname(&args.release_name);
+    runtime.block_on(async {
+        let mut port_forward = PortForward::start(
+            &args.kubectl_bin,
+            kubeconfig_path,
+            &args.gateway_namespace,
+            &service,
+            9082,
+            args.wait_secs,
+        )
+        .await?;
+        let scrape = scrape_prometheus_metrics(&port_forward.endpoint_url());
+        let shutdown = port_forward.shutdown();
+        let metrics = scrape?;
+        shutdown?;
+        Ok(metrics)
+    })
+}
+
+fn scrape_prometheus_metrics(endpoint: &str) -> Result<String> {
+    let authority = endpoint
+        .strip_prefix("http://")
+        .context("gateway metrics endpoint used an unsupported scheme")?;
+    let mut stream = TcpStream::connect(authority)
+        .with_context(|| format!("failed to connect to gateway metrics endpoint at {authority}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("failed to configure gateway metrics read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .context("failed to configure gateway metrics write timeout")?;
+    stream
+        .write_all(
+            format!("GET /metrics HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .context("failed to request gateway metrics")?;
+    let mut response = Vec::new();
+    stream
+        .take(MAX_GATEWAY_PROMETHEUS_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response)
+        .context("failed to read gateway metrics response")?;
+    if response.len() > MAX_GATEWAY_PROMETHEUS_RESPONSE_BYTES as usize {
+        bail!("gateway metrics response exceeded the bounded capture size");
+    }
+    let response = String::from_utf8(response).context("gateway metrics response was not UTF-8")?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .context("gateway metrics response did not contain HTTP headers")?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        bail!("gateway metrics scrape returned non-200 response");
+    }
+    decode_chunked_metrics_body(head, body)
+}
+
+fn decode_chunked_metrics_body(head: &str, body: &str) -> Result<String> {
+    if !head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return Ok(body.to_owned());
+    }
+    let mut remaining = body.as_bytes();
+    let mut decoded = Vec::with_capacity(body.len());
+    loop {
+        let line_end = remaining
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .context("chunked gateway metrics response omitted chunk length")?;
+        let raw_len = std::str::from_utf8(&remaining[..line_end])
+            .context("chunked gateway metrics length was not UTF-8")?;
+        let raw_len = match raw_len.split(';').next() {
+            Some(value) => value,
+            None => bail!("chunked gateway metrics length was absent"),
+        };
+        let chunk_len = usize::from_str_radix(raw_len, 16)
+            .context("chunked gateway metrics length was invalid")?;
+        remaining = &remaining[line_end + 2..];
+        if chunk_len == 0 {
+            break;
+        }
+        let chunk_end = chunk_len
+            .checked_add(2)
+            .context("chunked gateway metrics length overflowed")?;
+        if remaining.len() < chunk_end || &remaining[chunk_len..chunk_end] != b"\r\n" {
+            bail!("chunked gateway metrics response was truncated");
+        }
+        decoded.extend_from_slice(&remaining[..chunk_len]);
+        if decoded.len() > MAX_GATEWAY_PROMETHEUS_RESPONSE_BYTES as usize {
+            bail!("decoded gateway metrics response exceeded the bounded capture size");
+        }
+        remaining = &remaining[chunk_end..];
+    }
+    String::from_utf8(decoded).context("decoded gateway metrics response was not UTF-8")
+}
+
+fn parse_gateway_multipart_snapshot(metrics: &str) -> Result<GatewayMultipartSnapshot> {
+    Ok(GatewayMultipartSnapshot {
+        create_requests: prometheus_counter_sum(
+            metrics,
+            "rs3_s3_requests_total",
+            "operation=\"CreateMultipartUpload\"",
+        )?,
+        upload_requests: prometheus_counter_sum(
+            metrics,
+            "rs3_s3_requests_total",
+            "operation=\"UploadPart\"",
+        )?,
+        complete_requests: prometheus_counter_sum(
+            metrics,
+            "rs3_s3_requests_total",
+            "operation=\"CompleteMultipartUpload\"",
+        )?,
+        upload_bytes: prometheus_counter_sum(
+            metrics,
+            "rs3_s3_request_body_bytes_total",
+            "operation=\"UploadPart\"",
+        )?,
+    })
+}
+
+fn prometheus_counter_sum(metrics: &str, metric_name: &str, required_label: &str) -> Result<u64> {
+    let mut total = 0_u64;
+    for line in metrics.lines() {
+        let Some((identity, raw_value)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let exact_prefix = format!("{metric_name}{{");
+        if !identity.starts_with(&exact_prefix)
+            || !identity.contains(required_label)
+            || (metric_name == "rs3_s3_requests_total"
+                && (!identity.contains("result=\"ok\"")
+                    || !identity.contains("status_code=\"200\"")))
+        {
+            continue;
+        }
+        let value = raw_value
+            .parse::<u64>()
+            .with_context(|| format!("invalid Prometheus counter for {metric_name}"))?;
+        total = total
+            .checked_add(value)
+            .context("gateway multipart Prometheus counter overflowed")?;
+    }
+    Ok(total)
+}
+
+fn gateway_multipart_snapshot_json(snapshot: &GatewayMultipartSnapshot) -> Value {
+    json!({
+        "successful_create_requests": snapshot.create_requests,
+        "successful_upload_part_requests": snapshot.upload_requests,
+        "successful_complete_requests": snapshot.complete_requests,
+        "observed_upload_part_bytes": snapshot.upload_bytes,
+    })
 }
 
 fn sanitize_file_component(value: &str) -> String {
@@ -780,7 +1007,10 @@ fn parse_log_json(line: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gateway_backend_metrics_json, integration_storage_proxy_metrics_json};
+    use super::{
+        gateway_backend_metrics_json, integration_storage_proxy_metrics_json,
+        parse_gateway_multipart_snapshot,
+    };
 
     #[test]
     fn metrics_parse_kubectl_prefixed_json_logs() {
@@ -814,6 +1044,22 @@ mod tests {
             metrics["derived"]["repository_backend_bytes_written_per_client_byte"],
             serde_json::json!(2.0)
         );
+    }
+
+    #[test]
+    fn multipart_snapshot_counts_successful_client_requests_and_uploaded_bytes() {
+        let metrics = r#"
+rs3_s3_requests_total{operation="CreateMultipartUpload",result="ok",status_code="200"} 1
+rs3_s3_requests_total{operation="UploadPart",result="ok",status_code="200"} 2
+rs3_s3_requests_total{operation="UploadPart",result="error",status_code="500"} 1
+rs3_s3_requests_total{operation="CompleteMultipartUpload",result="ok",status_code="200"} 1
+rs3_s3_request_body_bytes_total{operation="UploadPart"} 7340032
+"#;
+        let snapshot = parse_gateway_multipart_snapshot(metrics).expect("multipart snapshot");
+        assert_eq!(snapshot.create_requests, 1);
+        assert_eq!(snapshot.upload_requests, 2);
+        assert_eq!(snapshot.complete_requests, 1);
+        assert_eq!(snapshot.upload_bytes, 7_340_032);
     }
 
     #[test]

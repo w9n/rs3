@@ -1,17 +1,16 @@
 //! Purpose-specific repository keyrings.
 
-use crate::checkpoint::derive_checkpoint_public_key_descriptor;
+use crate::checkpoint::{
+    checkpoint_public_key_bytes, derive_checkpoint_public_key,
+    derive_checkpoint_public_key_descriptor,
+};
 use crate::{CryptoError, SecretBytes};
 use getrandom::fill as fill_random;
 use rs3_types::{KeyDescriptor, KeyId, KeyPurpose, KeyStatus, RepositoryId};
 use std::collections::BTreeSet;
+use zeroize::Zeroizing;
 
-const NAMESPACE_ALGORITHM: &str = "hmac-sha256";
-const CONTENT_ALGORITHM: &str = "xchacha20poly1305";
-const METADATA_ALGORITHM: &str = "aes-256-gcm-siv-hmac-sha256-nonce-v1";
-const CHECKPOINT_ALGORITHM: &str = "ed25519";
-
-/// Minimum public repository salt length accepted by the production KDF path.
+/// Minimum public repository salt length accepted in envelope context.
 pub const MIN_REPOSITORY_SALT_LEN: usize = 32;
 
 /// Secret-bearing keyring entry.
@@ -33,7 +32,11 @@ impl KeyMaterial {
     }
 }
 
-/// Stable public context that binds derived keys to one repository.
+/// Stable public context bound into repository envelope associated data.
+///
+/// Neither field enters key derivation: data keys are independently random
+/// and envelope keys derive from the wrapping key alone. The salt is public
+/// envelope metadata that a verified envelope carries for its own opening.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryKeyContext {
     repository_id: RepositoryId,
@@ -55,12 +58,12 @@ impl RepositoryKeyContext {
         })
     }
 
-    /// Returns the public repository identifier bound into derived keys.
+    /// Returns the public repository identifier bound into envelopes.
     pub fn repository_id(&self) -> &RepositoryId {
         &self.repository_id
     }
 
-    /// Returns the public repository salt bound into derived keys.
+    /// Returns the public repository salt bound into envelopes.
     pub fn salt(&self) -> &[u8] {
         &self.salt
     }
@@ -122,36 +125,6 @@ impl KeyRing {
     pub fn primary_key_id(&self, purpose: KeyPurpose) -> Result<KeyId, CryptoError> {
         self.primary_key(purpose)
             .map(|key| key.descriptor.id.clone())
-    }
-
-    /// Returns a new keyring with a fresh primary key for `purpose`.
-    ///
-    /// The previous primary key for the same purpose is demoted to `Enabled`
-    /// so retained checkpoint chains and old objects can still be read or
-    /// verified. The caller is responsible for storing the returned keyring in
-    /// a new envelope and publishing a checkpoint that binds the envelope.
-    pub fn rotate_purpose_key(
-        &self,
-        purpose: KeyPurpose,
-        new_key_id: KeyId,
-        created_at_ms: i64,
-    ) -> Result<Self, CryptoError> {
-        let _ = self.primary_key(purpose)?;
-        let secret = random_secret()?;
-        let descriptor = rotated_descriptor(new_key_id, purpose, created_at_ms, &secret)?;
-        let mut keys = self
-            .keys
-            .iter()
-            .cloned()
-            .map(|mut key| {
-                if key.descriptor.purpose == purpose && key.descriptor.status.is_primary() {
-                    key.descriptor.status = KeyStatus::Enabled;
-                }
-                key
-            })
-            .collect::<Vec<_>>();
-        keys.push(KeyMaterial::new(descriptor, secret));
-        Self::new(keys)
     }
 
     /// Returns public key descriptors sorted for deterministic checkpoints.
@@ -257,6 +230,15 @@ fn validate_keyring(keys: &[KeyMaterial]) -> Result<(), CryptoError> {
                 key_id: key.descriptor.id.clone(),
             });
         }
+        if key.descriptor.purpose == KeyPurpose::CheckpointSigning
+            && let Some(public_key) = key.descriptor.public_key.as_deref()
+        {
+            let declared = checkpoint_public_key_bytes(public_key)?;
+            let derived = derive_checkpoint_public_key(&key.secret)?;
+            if !crate::ct_eq(&declared, &derived) {
+                return Err(CryptoError::CheckpointPublicKeyMismatch);
+            }
+        }
     }
 
     for purpose in [
@@ -286,8 +268,8 @@ fn validate_keyring(keys: &[KeyMaterial]) -> Result<(), CryptoError> {
 }
 
 fn random_secret() -> Result<SecretBytes, CryptoError> {
-    let mut secret = [0_u8; SecretBytes::MIN_LEN];
-    fill_random(&mut secret).map_err(|_| CryptoError::RandomnessUnavailable)?;
+    let mut secret = Zeroizing::new([0_u8; SecretBytes::MIN_LEN]);
+    fill_random(secret.as_mut()).map_err(|_| CryptoError::RandomnessUnavailable)?;
     SecretBytes::new(secret.to_vec())
 }
 
@@ -303,13 +285,9 @@ fn default_namespace_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("namespace-v1"),
         purpose: KeyPurpose::Namespace,
-        algorithm: NAMESPACE_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
-        not_before_ms: None,
-        not_after_ms: None,
         public_key: None,
-        external_kms_uri: None,
     }
 }
 
@@ -317,13 +295,9 @@ fn default_metadata_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("metadata-v1"),
         purpose: KeyPurpose::Metadata,
-        algorithm: METADATA_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
-        not_before_ms: None,
-        not_after_ms: None,
         public_key: None,
-        external_kms_uri: None,
     }
 }
 
@@ -331,13 +305,9 @@ fn default_content_descriptor() -> KeyDescriptor {
     KeyDescriptor {
         id: static_key_id("content-v1"),
         purpose: KeyPurpose::Content,
-        algorithm: CONTENT_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
-        not_before_ms: None,
-        not_after_ms: None,
         public_key: None,
-        external_kms_uri: None,
     }
 }
 
@@ -345,45 +315,10 @@ fn default_checkpoint_descriptor(secret: &SecretBytes) -> Result<KeyDescriptor, 
     Ok(KeyDescriptor {
         id: static_key_id("checkpoint-v1"),
         purpose: KeyPurpose::CheckpointSigning,
-        algorithm: CHECKPOINT_ALGORITHM.to_string(),
         status: KeyStatus::Primary,
         created_at_ms: 0,
-        not_before_ms: None,
-        not_after_ms: None,
         public_key: Some(derive_checkpoint_public_key_descriptor(secret)?),
-        external_kms_uri: None,
     })
-}
-
-fn rotated_descriptor(
-    id: KeyId,
-    purpose: KeyPurpose,
-    created_at_ms: i64,
-    secret: &SecretBytes,
-) -> Result<KeyDescriptor, CryptoError> {
-    Ok(KeyDescriptor {
-        id,
-        purpose,
-        algorithm: algorithm_for_purpose(purpose).to_owned(),
-        status: KeyStatus::Primary,
-        created_at_ms,
-        not_before_ms: None,
-        not_after_ms: None,
-        public_key: match purpose {
-            KeyPurpose::CheckpointSigning => Some(derive_checkpoint_public_key_descriptor(secret)?),
-            KeyPurpose::Namespace | KeyPurpose::Content | KeyPurpose::Metadata => None,
-        },
-        external_kms_uri: None,
-    })
-}
-
-fn algorithm_for_purpose(purpose: KeyPurpose) -> &'static str {
-    match purpose {
-        KeyPurpose::Namespace => NAMESPACE_ALGORITHM,
-        KeyPurpose::Content => CONTENT_ALGORITHM,
-        KeyPurpose::Metadata => METADATA_ALGORITHM,
-        KeyPurpose::CheckpointSigning => CHECKPOINT_ALGORITHM,
-    }
 }
 
 fn static_key_id(value: &str) -> KeyId {
@@ -418,13 +353,9 @@ mod tests {
             KeyDescriptor {
                 id: key_id(value),
                 purpose: KeyPurpose::Namespace,
-                algorithm: "hmac-sha256".to_string(),
                 status,
                 created_at_ms: 0,
-                not_before_ms: None,
-                not_after_ms: None,
                 public_key: None,
-                external_kms_uri: None,
             },
             secret(secret_byte),
         )
@@ -434,6 +365,36 @@ mod tests {
         match RepositoryId::new(value) {
             Ok(repository_id) => repository_id,
             Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[test]
+    fn signing_public_key_validation_applies_to_every_status() {
+        let correct =
+            super::derive_checkpoint_public_key_descriptor(&secret(2)).expect("descriptor");
+        let wrong =
+            super::derive_checkpoint_public_key_descriptor(&secret(3)).expect("other descriptor");
+        for status in [KeyStatus::Primary, KeyStatus::Enabled, KeyStatus::Disabled] {
+            let make_keyring = |public_key: Option<String>| {
+                let mut signing = namespace_key("signing", status, 2);
+                signing.descriptor.purpose = KeyPurpose::CheckpointSigning;
+                signing.descriptor.public_key = public_key;
+                KeyRing::new(vec![
+                    namespace_key("namespace", KeyStatus::Primary, 1),
+                    signing,
+                ])
+            };
+            assert!(make_keyring(None).is_ok());
+            assert!(make_keyring(Some(correct.clone())).is_ok());
+            assert!(make_keyring(Some(format!("ed25519:{}", correct[8..].to_uppercase()))).is_ok());
+            assert!(matches!(
+                make_keyring(Some(wrong.clone())),
+                Err(crate::CryptoError::CheckpointPublicKeyMismatch)
+            ));
+            assert!(matches!(
+                make_keyring(Some("ed25519:not-hex".to_owned())),
+                Err(crate::CryptoError::CheckpointPublicKeyMalformed)
+            ));
         }
     }
 
@@ -500,75 +461,6 @@ mod tests {
         secrets.sort();
         secrets.dedup();
         assert_eq!(secrets.len(), 4);
-    }
-
-    #[test]
-    fn rotate_purpose_key_demotes_old_primary_and_adds_new_primary() {
-        let keyring = match KeyRing::new(vec![namespace_key("old", KeyStatus::Primary, 1)]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-
-        let rotated = match keyring.rotate_purpose_key(KeyPurpose::Namespace, key_id("new"), 123) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-
-        let descriptors = rotated.descriptors();
-        let primary = match rotated.primary_key_id(KeyPurpose::Namespace) {
-            Ok(key_id) => key_id,
-            Err(error) => panic!("{error}"),
-        };
-        assert_eq!(primary, key_id("new"));
-        assert_eq!(
-            descriptors
-                .iter()
-                .map(|descriptor| (descriptor.id.clone(), descriptor.status))
-                .collect::<Vec<_>>(),
-            vec![
-                (key_id("new"), KeyStatus::Primary),
-                (key_id("old"), KeyStatus::Enabled)
-            ]
-        );
-    }
-
-    #[test]
-    fn rotate_checkpoint_signing_key_records_public_verification_key() {
-        let keyring = match KeyRing::generate_random() {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-
-        let rotated = match keyring.rotate_purpose_key(
-            KeyPurpose::CheckpointSigning,
-            key_id("checkpoint-v2"),
-            123,
-        ) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-
-        let descriptor = rotated
-            .descriptors()
-            .into_iter()
-            .find(|descriptor| descriptor.id == key_id("checkpoint-v2"))
-            .unwrap_or_else(|| panic!("missing rotated descriptor"));
-
-        assert_eq!(descriptor.purpose, KeyPurpose::CheckpointSigning);
-        assert_eq!(descriptor.status, KeyStatus::Primary);
-        assert!(descriptor.public_key.is_some());
-    }
-
-    #[test]
-    fn rotate_purpose_key_rejects_duplicate_key_id() {
-        let keyring = match KeyRing::new(vec![namespace_key("old", KeyStatus::Primary, 1)]) {
-            Ok(keyring) => keyring,
-            Err(error) => panic!("{error}"),
-        };
-
-        let rotated = keyring.rotate_purpose_key(KeyPurpose::Namespace, key_id("old"), 123);
-
-        assert!(rotated.is_err());
     }
 
     #[test]

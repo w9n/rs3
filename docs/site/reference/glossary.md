@@ -2,7 +2,7 @@
 
 ## Anchor
 
-External rollback boundary for the repository. In `v2-preview`, the anchor
+External rollback boundary for the repository. In `v3-preview`, the anchor
 records the accepted commit sequence, commit key, digest, signing key, format
 root, and provider version ID when available. A gateway must fail closed if it
 cannot read or advance the anchor.
@@ -22,13 +22,13 @@ namespace index uses blinded identifiers instead of plaintext path components.
 ## Checkpoint
 
 Older repository state summary used by the removed v1 stack and retained where
-compatibility text still needs to distinguish v1 from v2. Current `v2-preview`
+compatibility text still needs to distinguish v1 from v2. Current `v3-preview`
 state is selected by signed commits and an external anchor, not by the older
 checkpoint object stack.
 
 ## Commit
 
-Signed repository update. In `v2-preview`, a commit contains encrypted payload
+Signed repository update. In `v3-preview`, a commit contains encrypted payload
 sections plus an encrypted index delta or snapshot. The accepted commit chain is
 selected by the anchor and verified before state is trusted.
 
@@ -40,7 +40,7 @@ chain instead of trusting the newest object seen in storage.
 
 ## Format Root
 
-Encrypted repository-format metadata for `v2-preview`. It binds the repository
+Encrypted repository-format metadata for `v3-preview`. It binds the repository
 format, repository context, provider profile, and active keyring envelope
 reference so a backend cannot silently swap critical repository metadata.
 
@@ -101,7 +101,7 @@ rollback domain.
 ## Restore Bundle
 
 Operator-reviewed recovery artifact exported by `rs3 export-restore-bundle`.
-For `v2-preview`, it carries the anchor state and offline-signature payload
+For `v3-preview`, it carries the anchor state and offline-signature payload
 needed to recreate a lost external anchor after chain verification.
 
 ## Retention
@@ -122,7 +122,7 @@ Operator-supplied minimum accepted sequence for disaster recovery. Importing an
 anchor below the floor is rejected, even if the backend contains an otherwise
 valid commit chain.
 
-## v2-preview
+## v3-preview
 
 Current evaluation repository format. It uses random commit keys, signed commit
 headers, encrypted payload and index sections, an encrypted format root, an

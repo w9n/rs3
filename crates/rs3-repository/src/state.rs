@@ -1,14 +1,12 @@
 //! In-memory trusted repository state.
 
-use crate::error::{RepositoryError, Result};
 use crate::model::{RepositoryListEntry, RepositoryObjectMetadata};
 use rs3_index::{
-    DurableManifest, IndexDelta, IndexDeltaObject, NamespaceEntry, NamespaceIndex,
-    V2StandaloneStreamCarrierReference,
+    DurableManifest, NamespaceEntry, NamespaceIndex, V3StandaloneStreamCarrierReference,
 };
 use rs3_types::{
     BackendObjectId, BackendVersionId, BlindIndexKey, LegalHoldStatus, LogicalPath, ManifestId,
-    PrefixToken, RetentionPolicy, Sequence,
+    RetentionPolicy, Sequence,
 };
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -17,6 +15,10 @@ use std::sync::Arc;
 /// Trusted manifest metadata used by the current in-memory query model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TrustedManifest {
+    /// Accepted plaintext ETag, kept inside trusted metadata.
+    pub(crate) etag: rs3_types::ObjectEtag,
+    /// Verified checksum, visible only through authenticated object metadata.
+    pub(crate) checksum: Option<rs3_types::ObjectChecksum>,
     /// Client-visible key inside the trusted boundary.
     pub(crate) key: LogicalPath,
     /// Client-visible content length.
@@ -32,22 +34,20 @@ pub(crate) struct TrustedManifest {
 /// Mutable repository state guarded by the repository lock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RepositoryState {
+    /// Accepted bounded multipart results, independent of namespace liveness.
+    pub(crate) completion_receipts: rs3_index::completion::CompletionReceipts,
     /// Trusted namespace query model.
     pub(crate) namespace: NamespaceIndex,
     /// Trusted manifests keyed by opaque manifest ID.
     pub(crate) manifests: BTreeMap<ManifestId, TrustedManifest>,
     /// Trusted list entries keyed by plaintext path inside the trusted boundary.
     pub(crate) list_entries: BTreeMap<LogicalPath, RepositoryListEntry>,
-    /// Next logical sequence to allocate.
+    /// Highest applied logical mutation generation.
     pub(crate) next_sequence: Sequence,
-    /// Durable index mutations not yet covered by an accepted checkpoint.
-    pub(crate) pending_index_deltas: Vec<IndexDelta>,
-    /// Stable timestamp for the current unaccepted checkpoint draft.
-    pub(crate) pending_checkpoint_published_at_ms: Option<i64>,
-    /// Exact standalone carrier facts interned during v2 replay.
-    pub(crate) v2_standalone_carriers: BTreeMap<
+    /// Exact standalone carrier facts interned during v3 replay.
+    pub(crate) v3_standalone_carriers: BTreeMap<
         (BackendObjectId, Option<BackendVersionId>),
-        Arc<V2StandaloneStreamCarrierReference>,
+        Arc<V3StandaloneStreamCarrierReference>,
     >,
 }
 
@@ -55,27 +55,16 @@ impl Default for RepositoryState {
     fn default() -> Self {
         Self {
             namespace: NamespaceIndex::new(),
+            completion_receipts: Default::default(),
             manifests: BTreeMap::new(),
             list_entries: BTreeMap::new(),
             next_sequence: Sequence::ZERO,
-            pending_index_deltas: Vec::new(),
-            pending_checkpoint_published_at_ms: None,
-            v2_standalone_carriers: BTreeMap::new(),
+            v3_standalone_carriers: BTreeMap::new(),
         }
     }
 }
 
 impl RepositoryState {
-    pub(crate) fn upsert_namespace_entry(
-        &mut self,
-        entry: NamespaceEntry,
-        prefix_tokens: Vec<PrefixToken>,
-    ) {
-        let affected_manifest = self.manifests.get(&entry.manifest_id).cloned();
-        self.namespace.upsert(entry, prefix_tokens);
-        self.update_list_entry(affected_manifest);
-    }
-
     /// Inserts an entry for a repository generation whose listing projection
     /// is maintained separately from the legacy prefix-token index.
     pub(crate) fn upsert_namespace_entry_without_prefixes(&mut self, entry: NamespaceEntry) {
@@ -93,6 +82,7 @@ impl RepositoryState {
             self.list_entries.insert(
                 key,
                 RepositoryListEntry {
+                    etag: manifest.etag,
                     key: manifest.key,
                     content_len: manifest.content_len,
                     modified_at_ms: manifest.modified_at_ms,
@@ -105,22 +95,18 @@ impl RepositoryState {
     pub(crate) fn replace_namespace_entry(
         &mut self,
         entry: NamespaceEntry,
-        prefix_tokens: Vec<PrefixToken>,
+        prefix_tokens: Vec<rs3_types::PrefixToken>,
     ) {
         self.namespace.upsert(entry, prefix_tokens);
     }
 
-    pub(crate) fn tombstone_namespace_entry(
-        &mut self,
-        blind_key: BlindIndexKey,
-        generation: Sequence,
-    ) {
+    pub(crate) fn remove_namespace_entry(&mut self, blind_key: BlindIndexKey) {
         let affected_key = self
             .namespace
             .head(&blind_key)
             .and_then(|entry| self.manifests.get(&entry.manifest_id))
             .map(|manifest| manifest.key.clone());
-        self.namespace.tombstone(blind_key, generation);
+        self.namespace.remove(&blind_key);
         if let Some(key) = affected_key {
             self.refresh_list_entry(&key);
         }
@@ -165,6 +151,7 @@ impl RepositoryState {
                 continue;
             }
             let list_entry = RepositoryListEntry {
+                etag: manifest.etag,
                 key: manifest.key.clone(),
                 content_len: manifest.content_len,
                 modified_at_ms: manifest.modified_at_ms,
@@ -194,6 +181,8 @@ impl TrustedManifest {
     /// Converts trusted manifest metadata into public repository metadata.
     pub(crate) fn into_metadata(self) -> RepositoryObjectMetadata {
         RepositoryObjectMetadata {
+            etag: self.etag,
+            checksum: self.checksum,
             key: self.key,
             content_len: self.content_len,
             modified_at_ms: self.modified_at_ms,
@@ -205,6 +194,8 @@ impl TrustedManifest {
     /// Converts trusted manifest metadata into durable manifest metadata.
     pub(crate) fn into_durable(self) -> DurableManifest {
         DurableManifest {
+            etag: self.etag,
+            checksum: self.checksum,
             key: self.key,
             content_len: self.content_len,
             modified_at_ms: self.modified_at_ms,
@@ -212,50 +203,9 @@ impl TrustedManifest {
             legal_hold: self.legal_hold,
         }
     }
-
-    /// Converts durable manifest metadata into trusted manifest metadata.
-    pub(crate) fn from_durable(manifest: DurableManifest) -> Self {
-        Self {
-            key: manifest.key,
-            content_len: manifest.content_len,
-            modified_at_ms: manifest.modified_at_ms,
-            retention: manifest.retention,
-            legal_hold: manifest.legal_hold,
-        }
-    }
-}
-
-/// Allocates the next repository sequence.
-pub(crate) fn next_sequence(state: &mut RepositoryState) -> Result<Sequence> {
-    let next = state
-        .next_sequence
-        .checked_next()
-        .ok_or(RepositoryError::SequenceOverflow)?;
-    state.next_sequence = next;
-    Ok(next)
 }
 
 /// Builds deterministic material for opaque object IDs in the prototype model.
 pub(crate) fn object_material(key: &str, sequence: Sequence) -> Vec<u8> {
     format!("{key}\0{}", sequence.get()).into_bytes()
-}
-
-/// Applies a durable index delta object to trusted query state.
-pub(crate) fn apply_index_delta_object(state: &mut RepositoryState, delta: IndexDeltaObject) {
-    for delta in delta.deltas {
-        match delta {
-            IndexDelta::Upsert {
-                entry,
-                prefix_tokens,
-                sealed_manifest: _,
-            } => state.upsert_namespace_entry(*entry, prefix_tokens),
-            IndexDelta::Tombstone {
-                blind_key,
-                generation,
-                ..
-            } => state.tombstone_namespace_entry(blind_key, generation),
-        }
-    }
-
-    state.next_sequence = state.next_sequence.max(delta.sequence);
 }

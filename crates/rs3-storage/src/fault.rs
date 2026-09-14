@@ -1,8 +1,8 @@
 //! Fault-injecting `BlobStore` test utilities.
 
 use crate::{
-    BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartUpload, BlobRead, BlobStore,
-    ByteRange, PutOptions, Result, StorageError,
+    BlobList, BlobListMode, BlobListPage, BlobMetadata, BlobMultipartPart, BlobMultipartSession,
+    BlobMultipartUpload, BlobRead, BlobStore, ByteRange, PutOptions, Result, StorageError,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -70,6 +70,8 @@ pub struct FaultEvent {
     pub object_id: Option<BackendObjectId>,
     /// Prefix string, when the operation lists a prefix.
     pub prefix: Option<String>,
+    /// Requested read range, including streams; absent for non-read operations.
+    pub range: Option<ByteRange>,
 }
 
 /// Match criteria for a one-shot injected fault.
@@ -329,6 +331,16 @@ impl FaultScript {
         object_id: Option<&BackendObjectId>,
         prefix: Option<&str>,
     ) -> Result<FaultEffect> {
+        self.begin_with_range(kind, object_id, prefix, None)
+    }
+
+    fn begin_with_range(
+        &self,
+        kind: FaultOperationKind,
+        object_id: Option<&BackendObjectId>,
+        prefix: Option<&str>,
+        range: Option<ByteRange>,
+    ) -> Result<FaultEffect> {
         let (event, action) = {
             let mut state = self.write_state()?;
             let event = FaultEvent {
@@ -336,6 +348,7 @@ impl FaultScript {
                 kind,
                 object_id: object_id.cloned(),
                 prefix: prefix.map(ToOwned::to_owned),
+                range,
             };
             state.next_operation_index = state.next_operation_index.saturating_add(1);
             state.events.push(event.clone());
@@ -438,6 +451,10 @@ where
         finish_success(metadata, effect)
     }
 
+    fn supports_provider_delete_probe(&self) -> bool {
+        self.inner.supports_provider_delete_probe()
+    }
+
     fn supports_multipart_upload(&self) -> bool {
         self.inner.supports_multipart_upload()
     }
@@ -464,10 +481,35 @@ where
         finish_success(upload as Box<dyn BlobMultipartUpload>, effect)
     }
 
+    async fn create_multipart_session(
+        &self,
+        object_id: &BackendObjectId,
+        options: PutOptions,
+    ) -> Result<Box<dyn BlobMultipartSession>> {
+        let effect = self.script.begin(
+            FaultOperationKind::CreateMultipartUpload,
+            Some(object_id),
+            None,
+        )?;
+        let upload = self
+            .inner
+            .create_multipart_session(object_id, options)
+            .await?;
+        let upload = Box::new(FaultInjectingMultipartSession {
+            inner: upload,
+            script: self.script.clone(),
+            object_id: object_id.clone(),
+        });
+        finish_success(upload as Box<dyn BlobMultipartSession>, effect)
+    }
+
     async fn get_range(&self, object_id: &BackendObjectId, range: ByteRange) -> Result<Bytes> {
-        let effect = self
-            .script
-            .begin(FaultOperationKind::GetRange, Some(object_id), None)?;
+        let effect = self.script.begin_with_range(
+            FaultOperationKind::GetRange,
+            Some(object_id),
+            None,
+            Some(range),
+        )?;
         let body = self.inner.get_range(object_id, range).await?;
         finish_success(body, effect)
     }
@@ -478,9 +520,12 @@ where
         version_id: Option<&BackendVersionId>,
         range: ByteRange,
     ) -> Result<Bytes> {
-        let effect = self
-            .script
-            .begin(FaultOperationKind::GetRangeAt, Some(object_id), None)?;
+        let effect = self.script.begin_with_range(
+            FaultOperationKind::GetRangeAt,
+            Some(object_id),
+            None,
+            Some(range),
+        )?;
         let body = self
             .inner
             .get_range_at(object_id, version_id, range)
@@ -494,9 +539,12 @@ where
         version_id: Option<&BackendVersionId>,
         range: ByteRange,
     ) -> Result<Box<dyn BlobRead>> {
-        let effect = self
-            .script
-            .begin(FaultOperationKind::GetRangeAt, Some(object_id), None)?;
+        let effect = self.script.begin_with_range(
+            FaultOperationKind::GetRangeAt,
+            Some(object_id),
+            None,
+            Some(range),
+        )?;
         let read = self
             .inner
             .open_range_at(object_id, version_id, range)
@@ -510,9 +558,12 @@ where
         version_id: Option<&BackendVersionId>,
         max_bytes: u64,
     ) -> Result<Box<dyn BlobRead>> {
-        let effect = self
-            .script
-            .begin(FaultOperationKind::GetRangeAt, Some(object_id), None)?;
+        let effect = self.script.begin_with_range(
+            FaultOperationKind::GetRangeAt,
+            Some(object_id),
+            None,
+            Some(ByteRange::Full),
+        )?;
         let read = self
             .inner
             .open_bounded_full_at(object_id, version_id, max_bytes)
@@ -720,6 +771,55 @@ impl BlobMultipartUpload for FaultInjectingMultipartUpload {
             None,
         )?;
         let metadata = inner.complete().await?;
+        finish_success(metadata, effect)
+    }
+
+    async fn abort(self: Box<Self>) -> Result<()> {
+        let Self {
+            inner,
+            script,
+            object_id,
+        } = *self;
+        let effect = script.begin(FaultOperationKind::MultipartAbort, Some(&object_id), None)?;
+        inner.abort().await?;
+        finish_success((), effect)
+    }
+}
+
+struct FaultInjectingMultipartSession {
+    inner: Box<dyn BlobMultipartSession>,
+    script: FaultScript,
+    object_id: BackendObjectId,
+}
+
+#[async_trait]
+impl BlobMultipartSession for FaultInjectingMultipartSession {
+    async fn upload_part(
+        &self,
+        part_index: usize,
+        body: Box<dyn BlobRead>,
+    ) -> Result<BlobMultipartPart> {
+        let effect = self.script.begin(
+            FaultOperationKind::MultipartPutPart,
+            Some(&self.object_id),
+            None,
+        )?;
+        let part = self.inner.upload_part(part_index, body).await?;
+        finish_success(part, effect)
+    }
+
+    async fn complete(self: Box<Self>, parts: Vec<BlobMultipartPart>) -> Result<BlobMetadata> {
+        let Self {
+            inner,
+            script,
+            object_id,
+        } = *self;
+        let effect = script.begin(
+            FaultOperationKind::MultipartComplete,
+            Some(&object_id),
+            None,
+        )?;
+        let metadata = inner.complete(parts).await?;
         finish_success(metadata, effect)
     }
 

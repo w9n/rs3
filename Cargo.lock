@@ -3124,13 +3124,13 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm-siv",
  "chacha20poly1305",
+ "crc-fast",
  "getrandom 0.3.4",
  "hex",
  "hmac 0.12.1",
+ "md-5",
  "ring",
  "rs3-types",
- "serde",
- "serde_json",
  "sha2 0.10.9",
  "subtle",
  "thiserror",
@@ -3156,6 +3156,7 @@ dependencies = [
  "kube",
  "rs3-repository",
  "rs3-types",
+ "rustls",
  "tokio",
 ]
 
@@ -3167,7 +3168,6 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
- "getrandom 0.3.4",
  "hex",
  "metrics",
  "proptest",
@@ -3177,7 +3177,6 @@ dependencies = [
  "rs3-types",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",
@@ -3189,11 +3188,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "bytes",
  "clap",
  "futures-util",
  "getrandom 0.3.4",
  "hex",
+ "hmac 0.12.1",
  "http 1.4.2",
  "http-body-util",
  "hyper",
@@ -3201,6 +3202,7 @@ dependencies = [
  "k8s-openapi",
  "metrics",
  "metrics-exporter-prometheus",
+ "percent-encoding",
  "rs3-crypto",
  "rs3-index",
  "rs3-k8s",
@@ -3212,6 +3214,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "time",
  "tokio",
@@ -3230,6 +3233,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "bytes",
+ "http-body 1.0.1",
  "http-body-util",
  "metrics",
  "rs3-types",
@@ -3243,7 +3247,9 @@ dependencies = [
 name = "rs3-types"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -4756,7 +4762,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "zeroize",
 ]
 
 [[package]]

@@ -139,6 +139,7 @@ fn run_container_s3(args: S3LocalArgs) -> Result<()> {
         args.region,
         s3_container::S3ContainerOptions {
             object_lock: args.object_lock,
+            network: None,
         },
     )?;
 
@@ -175,7 +176,7 @@ fn run_container_gc_rehearsal(
     let retention_days = retention_days.to_string();
     let mut command = Command::new(executable);
     command.args([
-        "v2",
+        "repository",
         "gc-rehearsal",
         "--backend",
         "s3",

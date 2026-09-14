@@ -1,176 +1,149 @@
 # Cryptography Reference
 
-This page describes the current production-preview cryptographic shape. It is
-an implementation reference, not an external audit, FIPS validation, or stable
-repository-format promise.
+This reference describes the cryptography used by the current `v3-preview`
+gateway for implementers and security reviewers. It is not an external audit,
+FIPS validation, or stable repository-format promise. Exact encodings and
+bounds are in the [repository format reference](repository-format.md).
 
-## Boundary
+## Boundary and Keys
 
-All encryption, signing, hashing, key derivation, and secret-byte handling live
-behind `rs3-crypto`. Higher-level crates provide canonical bytes and public
-associated data; they should not add ad hoc cryptography.
+All encryption, signing, hashing, derivation, randomness and secret-byte handling
+live behind `rs3-crypto`. Higher-level crates supply canonical bytes and public
+associated data. Cryptography does not hide backend object count, ciphertext
+size, timing, broad object classes or provider network metadata.
 
-Cryptography protects repository bytes and state transitions. It does not hide
-backend object count, ciphertext size, request timing, broad object class
-prefixes, or provider network metadata.
+Initialization generates separate random keys for four purposes:
 
-## Key Material
-
-An empty repository initializes a random purpose-specific keyring:
-
-| Purpose | Current primitive |
+| Purpose | Primitive and use |
 | --- | --- |
-| Namespace lookup | HMAC-SHA-256 blind path and prefix tokens |
-| Payload encryption | XChaCha20-Poly1305 content keys |
-| Metadata encryption | AES-256-GCM-SIV metadata keys |
-| Commit signing | Ed25519 signing keys |
+| Namespace | HMAC-SHA-256 blinded lookup keys inside encrypted index runs |
+| Content | XChaCha20-Poly1305 payload segments |
+| Metadata | AES-256-GCM-SIV index frames and roots |
+| Signing | Ed25519 commit signatures |
 
-The keyring is stored as an encrypted keyring envelope. The repository stores
-only encrypted key material plus public key descriptors. The wrapping-key source
-stays outside the object store.
+Prefix listing uses ordered logical paths inside encrypted index frames; v03
+does not persist prefix-token objects. Backend object keys contain random
+identifiers, not content hashes or path derivations.
 
-The configured wrapping key is raw high-entropy key material. A human
-passphrase must be converted outside `rs3` by a KMS, HSM, Vault, or password
-KDF before it is provided as `RS3_KEYRING_WRAPPING_KEY_HEX`.
+The keyring is encrypted under an external high-entropy wrapping key. Kubernetes
+Secret custody is the initial deployment model; the wrapping-key source stays
+outside the object store. A human passphrase is not a suitable raw wrapping key.
+The public repository salt is authenticated envelope context, not another
+secret and not a key-derivation input: envelopes carry it publicly, bind it
+into their associated data, and a verified envelope supplies it on opening.
+Domain-separated HMAC derivations use explicit framing for variable-length
+inputs. New derivations require distinct domains inside `rs3-crypto`.
 
-## Derivation
+## Payload Authentication
 
-`rs3` uses domain-separated HMAC-SHA-256 for repository-local derivations:
+Payload carriers contain ciphertext and 16-byte tags only. Their layout is
+stored in the encrypted, authenticated index. There is no plaintext payload
+header or stored nonce per segment.
 
-- blind path lookup tokens
-- prefix lookup tokens
-- opaque backend object IDs
-- AEAD subkeys
-- deterministic metadata nonces
-- Ed25519 signing seeds
+Each carrier has a random 256-bit identity. Each sealing attempt has a fresh
+256-bit identity. A keyed HMAC derives each 24-byte XChaCha20-Poly1305 nonce
+from the authenticated context, attempt, part or record number, and segment
+number. [Shared segment authentication](repository-format.md#shared-segment-authentication)
+specifies the exact nonce and associated-data construction.
 
-New derivations must use a unique `rs3:` domain string. When a derivation input
-combines more than one variable-length field, the caller must use canonical
-length framing before deriving bytes.
+Associated data binds the repository and historical keyring, containing object
+key, content-key ID, optional section ordinal, carrier and attempt identities,
+part or record ordinal, segment ordinal, plaintext length, final-segment marker
+and carrier layout. Moving ciphertext to another context fails authentication.
+Provider versions are assigned after upload; accepted exact references bind
+them through signed, encrypted repository metadata.
 
-The public repository salt is bound into the keyring envelope context. It is
-restore metadata, not a password and not a second secret.
+A pack record of at most 64 KiB uses one segment. Larger packed records use
+64 KiB segments. Detached carriers record their segment size and ordered part
+attempts in the authenticated descriptor. Empty values are index-only.
+Replacement parts or changed packs require fresh attempts. Retransmitting
+already prepared ciphertext preserves its attempt; matching bytes alone do not
+identify a successful client operation.
 
-## Payloads
+Detached upload publication requires complete exact-version readback, length,
+EOF and ciphertext-digest verification under a 1 MiB chunk ceiling. Payload
+storage alone does not publish namespace state. Reads authenticate bounded
+segments before releasing plaintext; full detached reads withhold the final
+group until aggregate digest and exact EOF checks pass.
 
-Payloads are split into independently encrypted segments. Each segment uses:
+The optional process-local plaintext segment cache binds repository, historical
+keyring, exact carrier/version, attempt, part, segment and authenticated layout
+facts. It does not replace signature, AEAD or exact-version validation. Disable
+it with `RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES=0`.
 
-- XChaCha20-Poly1305
-- a content key selected from the repository keyring
-- a 24-byte nonce made from a random per-object prefix plus a segment counter
-- associated data containing the payload domain, authenticated payload
-  identity, segment size, segment plaintext length, segment index, and
-  final-segment marker
+## Metadata Authentication
 
-The associated data is authenticated but not encrypted. It is limited to public,
-path-free repository metadata.
+Index metadata uses AES-256-GCM-SIV with a fresh random 96-bit nonce from the
+operating system for each seal. The nonce and 16-byte tag travel with ciphertext.
+Randomness failure aborts sealing. Exact publication retries reuse prepared
+ciphertext; resealing is a new encryption.
 
-Payload authentication fails if a backend tampers with ciphertext, changes the
-segment context, or moves encrypted segment bytes into a different authenticated
-payload identity. For commit-embedded `v2-preview` payloads, the payload
-identity is derived from the signed commit key and payload ordinal; the bytes
-are physically stored inside the commit object.
+Index-frame associated data binds repository and historical keyring context,
+containing object key, section ordinal, run identity, framing header and frame
+descriptor. Index roots bind their repository context, containing object,
+section ordinal and root header. Signed section digests authenticate the exact
+stored index bytes selected for recovery.
 
-Segment size is recorded in each payload header and authenticated as segment
-associated data. For commit-embedded v2 payloads, the total plaintext length is
-authenticated by the signed index entry rather than repeated in every segment
-tag; readers verify that the signed length, payload header, and encrypted
-section length agree before serving ranges. The default writer chooses the
-segment size per object: small objects keep 512 B segments, medium objects use
-8 KiB, and larger objects use 64 KiB. This changes overhead and read
-granularity without changing the repository format because readers trust
-authenticated per-object metadata, not a global setting.
+Front coding compresses listing paths inside encrypted frames. Ciphertext sizes
+can reveal aggregate path lengths and shared-prefix structure. Full paths stay
+inside trusted gateway memory. Aggregate key-use and rotation limits still
+require production qualification and external review.
 
-The gateway may cache decrypted payload segments in memory. The default limit is
-256 MiB and can be disabled with
-`RS3_DECRYPTED_SEGMENT_CACHE_MAX_BYTES=0`. The cache key uses the backend object
-ID, provider version ID when present, and segment index; it does not use
-client-visible paths. The cache is process-local acceleration only: commit
-verification, AEAD authentication, and exact-version restore rules are
-unchanged.
+## Keyring and Format Envelopes
 
-## Metadata
+Both envelopes use canonical version-3 CBOR and AES-256-GCM-SIV with a random
+96-bit nonce. Their associated data is the canonical map of version, purpose,
+generation, repository ID, public salt, wrapping-key ID and nonce. Each purpose
+derives a separate AEAD key from the wrapping key. Envelope SHA-256 digests
+cover the complete canonical bytes. Keyring plaintext and secret serialization
+use zeroizing buffers.
 
-Manifest and index metadata are sealed with AES-256-GCM-SIV. The metadata nonce
-is deterministic: it is derived from the metadata key, associated data, and
-plaintext. This makes retrying the same metadata write stable.
+The format root binds the full keyring-envelope reference, including generation,
+object ID, digest and provider version. Signed commits bind the historical
+keyring object and digest. The external anchor binds the exact format root.
+These bindings prevent a backend from substituting another envelope into
+accepted state.
 
-Deterministic sealing intentionally leaks equality for the same metadata key,
-associated data, and plaintext. The design accepts that leakage for the preview
-because the plaintext metadata is path-sensitive and encrypted, while the
-remaining equality signal is narrower than exposing paths or Kubernetes names.
+Rewrap changes wrapping protection around unchanged repository data keys; it
+cannot restore confidentiality after those data keys are compromised. The
+gateway has no in-place format or data-key rotation operation. Historical
+reads can use enabled keys. Retirement requires proof that no protected restore
+root needs the key.
 
-Metadata associated data is object-type specific:
+## Signed Commits and Recovery Bundles
 
-- manifest records bind to the manifest ID
-- index deltas bind to the index-delta object domain
+V03 commits use Ed25519 over the complete 40-byte prelude and canonical CBOR
+header with the signature field zeroed. The header binds sequence, self key,
+exact parent, publish time, kind, algorithm identifiers, historical keyring,
+section layout/digests and body digest. The body digest is SHA-256 over the exact
+concatenated section bytes. There is no separate header digest. The anchor and
+index root carry the format-root reference.
 
-Signed commits and object IDs decide which sealed metadata is reachable
-repository state.
+The external Kubernetes Lease selects the accepted exact commit and format
+references. Sequence and parent checks establish chain order; backend listing
+order and timestamps do not. Strict parent-relative publication timestamps are
+not yet enforced by the writer or replay. They must not be treated as a proven
+retention-history clock.
 
-## Keyring Envelopes
+Version-3 recovery bundles use canonical CBOR. Optional offline Ed25519
+signatures bind repository identity, salt digest, accepted anchor, recovery
+floor and export time under a separate signature domain. Signed bundle import
+is an explicit disaster-recovery path; an offline signer is not a dependency of
+normal initialization or serving.
 
-Keyring envelopes use AES-256-GCM-SIV with a random 96-bit nonce. Envelope
-associated data binds:
+## Review Requirements
 
-- envelope format version
-- envelope generation
-- repository ID
-- public repository salt
-- wrapping-key ID
-- envelope nonce
+Changes must preserve path-free associated data and diagnostics, bounded parsing,
+AEAD authentication before plaintext release, and fail-closed anchor handling.
+Fixed public keys and nonces in golden fixtures are test inputs only. See
+[Testing](../testing.md#v03-codec-fixtures) for executable coverage
+and its limitations.
 
-The encrypted v2 format root and signed commits bind the active envelope by
-generation, object ID, and digest. The backend cannot silently swap a different
-envelope into accepted repository state without breaking that binding.
-
-Rewrapping an envelope changes only the wrapping-key source around the same
-repository data keys. It is operational hygiene, not compromise recovery.
-
-Data-key rotation changes one purpose-specific repository key at a time. The old
-primary remains enabled for historical reads or commit verification until
-retention-aware retirement verifies it is no longer required. A rotated keyring is
-stored in a new envelope and becomes active only when accepted v2 repository
-state binds that envelope.
-
-## V2 Commits
-
-V2 commits sign canonical repository-state transitions with Ed25519. The signed
-header includes the sequence, parent commit reference, section table, active
-keyring-envelope reference, publish time, active format-root reference, and
-signature metadata.
-
-Commit body digests are domain-separated SHA-256 digests over the serialized
-commit body. Commit keys are random and path-private. The Kubernetes Lease
-anchor stores the accepted commit position: sequence, commit key, body digest,
-signing key ID, format-root reference, and provider version ID when required.
-Retained commit versions are useful history, not the latest-state authority.
-
-## Review Rules
-
-Before adding or changing crypto-sensitive code:
-
-- keep the primitive inside `rs3-crypto`
-- use AEAD instead of separate encryption and MAC glue
-- make nonce uniqueness or deterministic misuse-resistance explicit
-- authenticate public context with associated data
-- keep plaintext paths and Kubernetes names out of object keys, AAD, logs,
-  metrics, traces, tags, and unauthenticated metadata
-- keep secrets out of `Debug`, errors, and reports unless intentionally printed
-  as generated key material
-- document new leakage in the security model
-
-## Preview Limits
-
-The current design has not had an external cryptographic review. Before a stable
-repository format, the project still needs final review of:
-
-- deterministic metadata sealing and accepted equality leakage
-- prefix-token structure and namespace-shape leakage
-- padding and pack-size policy
-- KMS/HSM/Vault wrapping-key workflow
-- key-retirement policy for retained historical data
-- durable format compatibility guarantees
+Production qualification still requires external cryptographic review, nonce
+and aggregate key-use analysis, retained-key retirement policy, current-provider
+recovery evidence and the remaining history implementation. See the
+[security model](../security-model.md) and
+[production-preview gates](../production-preview.md).
 
 ## References
 

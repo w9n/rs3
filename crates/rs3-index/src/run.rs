@@ -1,9 +1,9 @@
-//! Canonical bounded plaintext encoding for v02 index runs.
+//! Canonical bounded plaintext encoding for v03 index runs.
 
-use crate::PayloadHeaderReference;
+use crate::PayloadLayout;
 use rs3_types::{
-    BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
-    RetentionMode, RetentionPolicy, Sequence,
+    BackendObjectId, BackendVersionId, BlindIndexKey, ChecksumType, KeyId, LegalHoldStatus,
+    LogicalPath, ObjectChecksum, ObjectEtag, RetentionMode, RetentionPolicy, Sequence,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,18 +12,16 @@ use std::fmt;
 pub const INDEX_RUN_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-run-frame-plaintext:v2\n";
 
 /// Version of the canonical index-run wire encoding.
-pub const INDEX_RUN_WIRE_VERSION: u16 = 6;
+pub const INDEX_RUN_WIRE_VERSION: u16 = 10;
 
-/// Maximum stored size of one v02 payload pack.
+/// Maximum stored size of one v03 payload pack.
 pub const INDEX_PACK_MAX_STORED_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Maximum number of records in one v02 payload pack.
+/// Maximum number of records in one v03 payload pack.
 pub const INDEX_PACK_MAX_RECORDS: u32 = 4_096;
 
-const INDEX_PACK_SEGMENT_BYTES: u64 = 64 * 1024;
-const INDEX_PACK_SEGMENT_TAG_BYTES: u64 = 16;
-const INDEX_STREAM_SEGMENT_TAG_BYTES: u64 = 16;
-const INDEX_STREAM_MAX_HEADER_BYTES: u64 = 4 * 1024;
+const INDEX_PACK_SEGMENT_BYTES: u64 = rs3_types::PAYLOAD_PACK_SEGMENT_BYTES as u64;
+const INDEX_PACK_SEGMENT_TAG_BYTES: u64 = rs3_types::PAYLOAD_AEAD_TAG_LEN as u64;
 
 /// Decoder and encoder resource limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +30,7 @@ pub struct IndexRunLimits {
     pub max_total_bytes: usize,
     /// Maximum plaintext bytes in one independently authenticated frame.
     pub max_frame_bytes: usize,
-    /// Maximum encoded size of one container or mutation record.
+    /// Maximum ordinary record size; standalone part tables have a separate 512 KiB cap.
     pub max_record_bytes: usize,
     /// Maximum combined number of external payload containers.
     pub max_containers: usize,
@@ -51,7 +49,7 @@ pub struct IndexRunLimits {
 impl Default for IndexRunLimits {
     fn default() -> Self {
         Self {
-            // The physical v02 run envelope is 8 MiB and adds an authenticated
+            // The physical v03 run envelope is 8 MiB and adds an authenticated
             // header plus framing around these plaintext bytes.
             max_total_bytes: 7 * 1024 * 1024,
             max_frame_bytes: 1024 * 1024 - 1024,
@@ -66,7 +64,7 @@ impl Default for IndexRunLimits {
     }
 }
 
-/// Raw fixed-width blind index key used by the v02 wire format.
+/// Raw fixed-width blind index key used by the v03 wire format.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IndexBlindKey([u8; 32]);
 
@@ -149,39 +147,12 @@ pub struct IndexRunContainer {
     pub pack_section_len: u64,
     /// Random identity bound into every payload-pack AEAD operation.
     pub pack_id: [u8; 32],
+    /// Fresh sealing attempt shared by this immutable pack.
+    pub attempt_id: rs3_types::PayloadAttemptId,
     /// Historical content-encryption key needed to open payload records.
     pub content_key_id: KeyId,
     /// Authenticated number of records in the payload-pack directory.
     pub pack_record_count: u32,
-}
-
-/// Exact external streamed-payload container referenced by compact pointers.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct IndexRunStreamContainer {
-    /// Opaque backend object identifier of the containing commit.
-    pub object_id: BackendObjectId,
-    /// Exact provider version, when the provider supplies version identifiers.
-    pub version_id: Option<BackendVersionId>,
-    /// Stored commit length used to constrain range reads.
-    pub stored_len: u64,
-    /// Signed commit body digest authenticating every declared section.
-    pub commit_body_digest: [u8; 32],
-    /// Historical encrypted-keyring envelope selected by the containing commit.
-    pub keyring_envelope: IndexRunKeyringRef,
-    /// Absolute byte offset where the commit's section region begins.
-    pub sections_start: u64,
-    /// Ordinal of the streamed payload section in the containing commit.
-    pub payload_section_ordinal: u32,
-    /// Byte offset of the payload relative to the commit's section region.
-    pub payload_section_offset: u64,
-    /// Exact stored byte length of the streamed payload section.
-    pub payload_section_len: u64,
-    /// Signed digest of the complete streamed payload section.
-    pub payload_section_digest: [u8; 32],
-    /// Opaque identity bound into every streamed-payload AEAD operation.
-    pub payload_id: BackendObjectId,
-    /// Authenticated header facts needed for direct range reads.
-    pub payload_header: PayloadHeaderReference,
 }
 
 /// Exact standalone streamed-payload object referenced by compact pointers.
@@ -198,7 +169,7 @@ pub struct IndexRunStandaloneStreamContainer {
     /// Historical encrypted-keyring envelope selected when the payload was sealed.
     pub keyring_envelope: IndexRunKeyringRef,
     /// Authenticated header facts needed for direct range reads.
-    pub payload_header: PayloadHeaderReference,
+    pub payload_layout: PayloadLayout,
 }
 
 impl fmt::Debug for IndexRunStandaloneStreamContainer {
@@ -210,27 +181,7 @@ impl fmt::Debug for IndexRunStandaloneStreamContainer {
             .field("stored_len", &self.stored_len)
             .field("object_digest", &"<redacted>")
             .field("keyring_envelope", &self.keyring_envelope)
-            .field("payload_header", &"<redacted>")
-            .finish()
-    }
-}
-
-impl fmt::Debug for IndexRunStreamContainer {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("IndexRunStreamContainer")
-            .field("object_id", &self.object_id)
-            .field("version_id", &self.version_id)
-            .field("stored_len", &self.stored_len)
-            .field("commit_body_digest", &"<redacted>")
-            .field("keyring_envelope", &self.keyring_envelope)
-            .field("sections_start", &self.sections_start)
-            .field("payload_section_ordinal", &self.payload_section_ordinal)
-            .field("payload_section_offset", &self.payload_section_offset)
-            .field("payload_section_len", &self.payload_section_len)
-            .field("payload_section_digest", &"<redacted>")
-            .field("payload_id", &self.payload_id)
-            .field("payload_header", &"<redacted>")
+            .field("payload_layout", &"<redacted>")
             .finish()
     }
 }
@@ -278,34 +229,14 @@ impl fmt::Debug for IndexRunKeyringRef {
 pub struct IndexRunSelfPack {
     /// Random identity bound into every payload-pack AEAD operation.
     pub pack_id: [u8; 32],
+    /// Fresh sealing attempt shared by this immutable pack.
+    pub attempt_id: rs3_types::PayloadAttemptId,
     /// Historical content-encryption key needed to open payload records.
     pub content_key_id: KeyId,
     /// Exact stored payload-pack section length.
     pub stored_len: u64,
     /// Authenticated number of records in the pack.
     pub record_count: u32,
-}
-
-/// Shared facts for a streamed payload carried by the same commit as an index run.
-#[derive(Clone, PartialEq, Eq)]
-pub struct IndexRunSelfStream {
-    /// Ordinal of the streamed payload section in the containing commit.
-    pub payload_section_ordinal: u32,
-    /// Opaque identity bound into every streamed-payload AEAD operation.
-    pub payload_id: BackendObjectId,
-    /// Authenticated header facts needed for direct range reads.
-    pub payload_header: PayloadHeaderReference,
-}
-
-impl fmt::Debug for IndexRunSelfStream {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("IndexRunSelfStream")
-            .field("payload_section_ordinal", &self.payload_section_ordinal)
-            .field("payload_id", &self.payload_id)
-            .field("payload_header", &"<redacted>")
-            .finish()
-    }
 }
 
 impl fmt::Debug for IndexRunSelfPack {
@@ -356,14 +287,7 @@ pub enum IndexPayloadPointer {
         /// Exact record read and authentication facts.
         record: IndexPackRecordPointer,
     },
-    /// Streamed payload carried by the same commit as this run.
-    SelfStream,
-    /// Streamed payload in an exact external commit container.
-    ExternalStream {
-        /// Ordinal into [`IndexRun::stream_containers`].
-        container_ordinal: u32,
-    },
-    /// Streamed payload in an exact standalone object.
+    /// Payload in an exact standalone object.
     ExternalStandaloneStream {
         /// Ordinal into [`IndexRun::standalone_stream_containers`].
         container_ordinal: u32,
@@ -393,6 +317,10 @@ pub struct IndexUpsert {
     pub retention: Option<RetentionPolicy>,
     /// Effective legal-hold state, when present.
     pub legal_hold: Option<LegalHoldStatus>,
+    /// Trusted plaintext MD5 ETag for this object.
+    pub etag: ObjectEtag,
+    /// Client-declared checksum accepted for the complete object, when present.
+    pub checksum: Option<ObjectChecksum>,
 }
 
 impl fmt::Debug for IndexUpsert {
@@ -409,6 +337,8 @@ impl fmt::Debug for IndexUpsert {
             .field("modified_at_ms", &self.modified_at_ms)
             .field("retention", &self.retention)
             .field("legal_hold", &self.legal_hold)
+            .field("etag", &"<redacted>")
+            .field("checksum", &self.checksum)
             .finish()
     }
 }
@@ -463,16 +393,14 @@ impl IndexMutation {
 /// Canonical bounded plaintext index run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexRun {
+    /// One completion accepted with this mutation, encrypted in run metadata.
+    pub completion_receipt: Option<crate::completion::CompletionReceipt>,
     /// Repository sequence represented by this batch.
     pub sequence: Sequence,
     /// Exact shared facts for the payload pack carried by this run's commit.
     pub self_pack: Option<IndexRunSelfPack>,
-    /// Exact shared facts for a streamed payload carried by this run's commit.
-    pub self_stream: Option<IndexRunSelfStream>,
     /// Deduplicated exact external payload-pack containers.
     pub containers: Vec<IndexRunContainer>,
-    /// Deduplicated exact external streamed-payload containers.
-    pub stream_containers: Vec<IndexRunStreamContainer>,
     /// Deduplicated exact standalone streamed-payload objects.
     pub standalone_stream_containers: Vec<IndexRunStandaloneStreamContainer>,
     /// Canonically ordered namespace mutations.
@@ -582,6 +510,8 @@ pub enum IndexRunError {
     TrailingBytes,
     /// An integer used a longer varint representation than necessary.
     NonCanonicalVarint,
+    /// A path prefix exceeds its predecessor or is not the longest shared prefix.
+    InvalidPathPrefix,
     /// An encoded integer cannot be represented by the target type.
     IntegerOverflow,
     /// A byte or record limit was exceeded.
@@ -631,8 +561,6 @@ pub enum IndexRunError {
     PackRecordFactsMismatch,
     /// A container-table entry is not referenced by any namespace mutation.
     UnusedContainer(u32),
-    /// A streamed-container-table entry is not referenced by any namespace mutation.
-    UnusedStreamContainer(u32),
     /// A standalone-stream table entry is not referenced by any namespace mutation.
     UnusedStandaloneStreamContainer(u32),
     /// Namespace-key table entries are not in canonical order.
@@ -645,12 +573,8 @@ pub enum IndexRunError {
     InvalidNamespaceKeyOrdinal(u32),
     /// A payload-pack section is empty or falls outside its containing object.
     InvalidContainerRange,
-    /// A streamed payload section or its authenticated header facts are invalid.
-    InvalidStreamContainer,
     /// A standalone streamed payload or its authenticated header facts are invalid.
     InvalidStandaloneStreamContainer,
-    /// A self-stream declaration is unused, absent when referenced, or conflicts with a self pack.
-    InvalidSelfStream,
     /// A payload pointer references no container-table entry.
     InvalidContainerOrdinal(u32),
     /// Empty payload pointers and logical content lengths disagree.
@@ -702,6 +626,7 @@ impl fmt::Display for IndexRunError {
             Self::UnexpectedEof => formatter.write_str("truncated index run"),
             Self::TrailingBytes => formatter.write_str("trailing bytes after index run"),
             Self::NonCanonicalVarint => formatter.write_str("non-canonical varint"),
+            Self::InvalidPathPrefix => formatter.write_str("invalid listing path prefix"),
             Self::IntegerOverflow => formatter.write_str("encoded integer overflow"),
             Self::LimitExceeded {
                 field,
@@ -734,9 +659,6 @@ impl fmt::Display for IndexRunError {
             Self::UnusedContainer(ordinal) => {
                 write!(formatter, "unused container ordinal {ordinal}")
             }
-            Self::UnusedStreamContainer(ordinal) => {
-                write!(formatter, "unused stream container ordinal {ordinal}")
-            }
             Self::UnusedStandaloneStreamContainer(ordinal) => {
                 write!(
                     formatter,
@@ -758,13 +680,9 @@ impl fmt::Display for IndexRunError {
             Self::InvalidContainerRange => {
                 formatter.write_str("invalid payload-pack section range")
             }
-            Self::InvalidStreamContainer => {
-                formatter.write_str("invalid streamed payload container")
-            }
             Self::InvalidStandaloneStreamContainer => {
                 formatter.write_str("invalid standalone streamed payload container")
             }
-            Self::InvalidSelfStream => formatter.write_str("invalid self streamed payload"),
             Self::InvalidContainerOrdinal(ordinal) => {
                 write!(formatter, "invalid container ordinal {ordinal}")
             }
@@ -831,30 +749,18 @@ pub fn encode_index_run_frames(
     let container_count = run
         .containers
         .len()
-        .checked_add(run.stream_containers.len())
-        .and_then(|count| count.checked_add(run.standalone_stream_containers.len()))
+        .checked_add(run.standalone_stream_containers.len())
         .ok_or(IndexRunError::IntegerOverflow)?;
     validate_count("container count", container_count, limits.max_containers)?;
     validate_count("mutation count", run.mutations.len(), limits.max_mutations)?;
     validate_self_pack(run.self_pack.as_ref(), limits)?;
-    validate_self_stream(run.self_stream.as_ref(), limits)?;
-    if run.self_pack.is_some() && run.self_stream.is_some() {
-        return Err(IndexRunError::InvalidSelfStream);
-    }
-    let self_payload = match (run.self_pack.as_ref(), run.self_stream.as_ref()) {
-        (None, None) => IndexRunSelfPayload::None,
-        (Some(pack), None) => IndexRunSelfPayload::Pack(pack),
-        (None, Some(stream)) => IndexRunSelfPayload::Stream(stream),
-        (Some(_), Some(_)) => return Err(IndexRunError::InvalidSelfStream),
+    let self_payload = match run.self_pack.as_ref() {
+        None => IndexRunSelfPayload::None,
+        Some(pack) => IndexRunSelfPayload::Pack(pack),
     };
     validate_containers(&run.containers, limits)?;
-    validate_stream_containers(&run.stream_containers, limits)?;
     validate_standalone_stream_containers(&run.standalone_stream_containers, limits)?;
-    validate_distinct_container_objects(
-        &run.containers,
-        &run.stream_containers,
-        &run.standalone_stream_containers,
-    )?;
+    validate_distinct_container_objects(&run.containers, &run.standalone_stream_containers)?;
     validate_mutations(run, limits)?;
 
     let namespace_key_ids = run
@@ -872,6 +778,7 @@ pub fn encode_index_run_frames(
 
     let metadata_count = container_count
         .checked_add(namespace_key_ids.len())
+        .and_then(|count| count.checked_add(usize::from(run.completion_receipt.is_some())))
         .ok_or(IndexRunError::IntegerOverflow)?;
     let mut metadata = Vec::with_capacity(metadata_count);
     for container in &run.containers {
@@ -886,10 +793,11 @@ pub fn encode_index_run_frames(
             &container.keyring_envelope,
             limits,
         )?;
-        record.u32(container.pack_section_ordinal)?;
+        record.varint(u64::from(container.pack_section_ordinal))?;
         record.u64(container.pack_section_offset)?;
         record.u64(container.pack_section_len)?;
         record.bytes(&container.pack_id)?;
+        record.bytes(container.attempt_id.as_bytes())?;
         record.string(
             container.content_key_id.as_str(),
             limits.max_key_id_bytes,
@@ -898,33 +806,9 @@ pub fn encode_index_run_frames(
         record.varint(u64::from(container.pack_record_count))?;
         metadata.push(PreparedRecord::metadata(record.finish()));
     }
-    for container in &run.stream_containers {
-        let mut record = Writer::new(limits.max_record_bytes);
-        record.u8(1)?;
-        encode_exact_container(
-            &mut record,
-            &container.object_id,
-            container.version_id.as_ref(),
-            container.stored_len,
-            &container.commit_body_digest,
-            &container.keyring_envelope,
-            limits,
-        )?;
-        record.u64(container.sections_start)?;
-        record.u32(container.payload_section_ordinal)?;
-        record.u64(container.payload_section_offset)?;
-        record.u64(container.payload_section_len)?;
-        record.bytes(&container.payload_section_digest)?;
-        record.string(
-            container.payload_id.as_str(),
-            limits.max_object_id_bytes,
-            "payload id",
-        )?;
-        encode_payload_header(&mut record, &container.payload_header)?;
-        metadata.push(PreparedRecord::metadata(record.finish()));
-    }
+
     for container in &run.standalone_stream_containers {
-        let mut record = Writer::new(limits.max_record_bytes);
+        let mut record = Writer::new(STANDALONE_CONTAINER_MAX_BYTES.min(limits.max_frame_bytes));
         record.u8(2)?;
         encode_exact_container(
             &mut record,
@@ -935,7 +819,7 @@ pub fn encode_index_run_frames(
             &container.keyring_envelope,
             limits,
         )?;
-        encode_payload_header(&mut record, &container.payload_header)?;
+        encode_payload_layout(&mut record, &container.payload_layout)?;
         metadata.push(PreparedRecord::metadata(record.finish()));
     }
     for namespace_key_id in &namespace_key_ids {
@@ -945,6 +829,17 @@ pub fn encode_index_run_frames(
             namespace_key_id.as_str(),
             limits.max_key_id_bytes,
             "namespace key id",
+        )?;
+        metadata.push(PreparedRecord::metadata(record.finish()));
+    }
+
+    if let Some(receipt) = &run.completion_receipt {
+        let mut record = Writer::new(limits.max_record_bytes);
+        record.u8(4)?;
+        record.bytes(
+            &receipt
+                .encode()
+                .map_err(|_| IndexRunError::FrameFactsMismatch)?,
         )?;
         metadata.push(PreparedRecord::metadata(record.finish()));
     }
@@ -973,6 +868,8 @@ pub fn encode_index_run_frames(
                 record.i64(upsert.modified_at_ms)?;
                 encode_retention(&mut record, upsert.retention)?;
                 encode_legal_hold(&mut record, upsert.legal_hold)?;
+                encode_checksum(&mut record, upsert.checksum.as_ref())?;
+                record.bytes(&upsert.etag.encode())?;
             }
             IndexMutation::Tombstone(tombstone) => {
                 record.u8(1)?;
@@ -1008,18 +905,12 @@ pub fn encode_index_run_frames(
         match mutation {
             IndexMutation::Upsert(upsert) => {
                 record.u8(0)?;
-                record.string(upsert.path.as_str(), limits.max_path_bytes, "logical path")?;
                 record.varint(upsert.generation.get())?;
                 record.varint(upsert.content_len)?;
                 record.i64(upsert.modified_at_ms)?;
             }
             IndexMutation::Tombstone(tombstone) => {
                 record.u8(1)?;
-                record.string(
-                    tombstone.path.as_str(),
-                    limits.max_path_bytes,
-                    "logical path",
-                )?;
                 record.varint(tombstone.generation.get())?;
             }
         }
@@ -1079,13 +970,51 @@ impl PreparedRecord {
     fn metadata(bytes: Vec<u8>) -> Self {
         Self { bytes, bound: None }
     }
+
+    fn listing_path(&self) -> Option<&[u8]> {
+        match &self.bound {
+            Some(IndexRunSearchBound::Listing { path, .. }) => Some(path.as_str().as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn encoded_len(&self, previous_path: &[u8]) -> Result<usize, IndexRunError> {
+        let Some(path) = self.listing_path() else {
+            return Ok(self.bytes.len());
+        };
+        let prefix_len = shared_prefix_len(previous_path, path);
+        let suffix_len = path.len() - prefix_len;
+        self.bytes
+            .len()
+            .checked_add(varint_len(usize_to_u64(prefix_len)?))
+            .and_then(|len| len.checked_add(varint_len(usize_to_u64(suffix_len).ok()?)))
+            .and_then(|len| len.checked_add(suffix_len))
+            .ok_or(IndexRunError::IntegerOverflow)
+    }
+
+    fn encode(&self, writer: &mut Writer, previous_path: &[u8]) -> Result<(), IndexRunError> {
+        if let Some(path) = self.listing_path() {
+            let prefix_len = shared_prefix_len(previous_path, path);
+            writer.varint(usize_to_u64(prefix_len)?)?;
+            writer.varint(usize_to_u64(path.len() - prefix_len)?)?;
+            writer.bytes(&path[prefix_len..])?;
+        }
+        writer.bytes(&self.bytes)
+    }
+}
+
+fn shared_prefix_len(previous: &[u8], current: &[u8]) -> usize {
+    previous
+        .iter()
+        .zip(current)
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
 #[derive(Clone, Copy)]
 enum IndexRunSelfPayload<'a> {
     None,
     Pack(&'a IndexRunSelfPack),
-    Stream(&'a IndexRunSelfStream),
 }
 
 fn pack_prepared_frames(
@@ -1103,11 +1032,15 @@ fn pack_prepared_frames(
     let mut frames = Vec::new();
     let mut start = 0_usize;
     loop {
+        let role_ordinal =
+            u32::try_from(frames.len()).map_err(|_| IndexRunError::IntegerOverflow)?;
         let mut end = start;
         let mut payload_len = 0_usize;
+        let mut previous_path = &[][..];
         while let Some(record) = records.get(end) {
-            let framed_len = varint_len(usize_to_u64(record.bytes.len())?)
-                .checked_add(record.bytes.len())
+            let record_len = record.encoded_len(previous_path)?;
+            let framed_len = varint_len(usize_to_u64(record_len)?)
+                .checked_add(record_len)
                 .ok_or(IndexRunError::IntegerOverflow)?;
             let candidate_payload = payload_len
                 .checked_add(framed_len)
@@ -1115,6 +1048,8 @@ fn pack_prepared_frames(
             let candidate_count = end - start + 1;
             if frame_header_len(
                 role,
+                role_ordinal,
+                mutation_count,
                 records.len(),
                 candidate_count,
                 self_payload,
@@ -1127,6 +1062,7 @@ fn pack_prepared_frames(
                 break;
             }
             payload_len = candidate_payload;
+            previous_path = record.listing_path().unwrap_or_default();
             end += 1;
         }
         if end == start && !records.is_empty() {
@@ -1136,8 +1072,6 @@ fn pack_prepared_frames(
                 maximum: limits.max_frame_bytes,
             });
         }
-        let role_ordinal =
-            u32::try_from(frames.len()).map_err(|_| IndexRunError::IntegerOverflow)?;
         let frame_records = &records[start..end];
         let mut writer = Writer::new(limits.max_frame_bytes);
         encode_frame_header(
@@ -1153,10 +1087,13 @@ fn pack_prepared_frames(
                 namespace_key_count,
             },
         )?;
+        let mut previous_path = &[][..];
         for record in frame_records {
-            let mut encoded_record = Writer::new(limits.max_record_bytes);
-            encoded_record.bytes(&record.bytes)?;
+            let mut encoded_record =
+                Writer::new(record_limit(role, record.bytes.first().copied(), limits));
+            record.encode(&mut encoded_record, previous_path)?;
             writer.record(encoded_record)?;
+            previous_path = record.listing_path().unwrap_or_default();
         }
         frames.push(EncodedIndexRunFrame {
             role,
@@ -1195,7 +1132,7 @@ fn encode_frame_header(
     writer.bytes(INDEX_RUN_PLAINTEXT_DOMAIN)?;
     writer.u16(INDEX_RUN_WIRE_VERSION)?;
     writer.u8(frame_role_tag(facts.role))?;
-    writer.u32(facts.role_ordinal)?;
+    writer.varint(u64::from(facts.role_ordinal))?;
     writer.u64(facts.sequence.get())?;
     writer.varint(u64::from(facts.mutation_count))?;
     writer.varint(usize_to_u64(facts.role_record_count)?)?;
@@ -1206,15 +1143,10 @@ fn encode_frame_header(
             IndexRunSelfPayload::Pack(pack) => {
                 writer.u8(1)?;
                 writer.bytes(&pack.pack_id)?;
+                writer.bytes(pack.attempt_id.as_bytes())?;
                 writer.string(pack.content_key_id.as_str(), usize::MAX, "content key id")?;
                 writer.u64(pack.stored_len)?;
                 writer.varint(u64::from(pack.record_count))?;
-            }
-            IndexRunSelfPayload::Stream(stream) => {
-                writer.u8(2)?;
-                writer.u32(stream.payload_section_ordinal)?;
-                writer.string(stream.payload_id.as_str(), usize::MAX, "payload id")?;
-                encode_payload_header(writer, &stream.payload_header)?;
             }
         }
         writer.varint(usize_to_u64(facts.namespace_key_count)?)?;
@@ -1224,12 +1156,19 @@ fn encode_frame_header(
 
 fn frame_header_len(
     role: IndexRunFrameRole,
+    role_ordinal: u32,
+    mutation_count: u32,
     role_record_count: usize,
     frame_record_count: usize,
     self_payload: IndexRunSelfPayload<'_>,
     namespace_key_count: usize,
 ) -> Result<usize, IndexRunError> {
-    let base = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 4 + 8 + 5;
+    let base = INDEX_RUN_PLAINTEXT_DOMAIN.len()
+        + 2
+        + 1
+        + varint_len(u64::from(role_ordinal))
+        + 8
+        + varint_len(u64::from(mutation_count));
     let mut length = base
         .checked_add(varint_len(usize_to_u64(role_record_count)?))
         .and_then(|value| value.checked_add(varint_len(usize_to_u64(frame_record_count).ok()?)))
@@ -1241,7 +1180,7 @@ fn frame_header_len(
         match self_payload {
             IndexRunSelfPayload::Pack(pack) => {
                 length = length
-                    .checked_add(32)
+                    .checked_add(64)
                     .and_then(|value| {
                         value.checked_add(varint_len(
                             usize_to_u64(pack.content_key_id.as_str().len()).ok()?,
@@ -1252,20 +1191,7 @@ fn frame_header_len(
                     .and_then(|value| value.checked_add(varint_len(u64::from(pack.record_count))))
                     .ok_or(IndexRunError::IntegerOverflow)?;
             }
-            IndexRunSelfPayload::Stream(stream) => {
-                length = length
-                    .checked_add(4)
-                    .and_then(|value| {
-                        value.checked_add(varint_len(
-                            usize_to_u64(stream.payload_id.as_str().len()).ok()?,
-                        ))
-                    })
-                    .and_then(|value| value.checked_add(stream.payload_id.as_str().len()))
-                    .and_then(|value| {
-                        value.checked_add(payload_header_encoded_len(&stream.payload_header).ok()?)
-                    })
-                    .ok_or(IndexRunError::IntegerOverflow)?;
-            }
+
             IndexRunSelfPayload::None => {}
         }
         length = length
@@ -1314,46 +1240,61 @@ fn encode_exact_container(
     writer.bytes(&keyring_envelope.digest)
 }
 
-fn encode_payload_header(
-    writer: &mut Writer,
-    header: &PayloadHeaderReference,
-) -> Result<(), IndexRunError> {
-    writer.varint(header.chunk_size)?;
-    writer.varint(header.plaintext_len)?;
-    writer.string(header.key_id.as_str(), usize::MAX, "content key id")?;
-    writer.bytes(&header.nonce_prefix)?;
-    writer.varint(header.header_len)
+const STANDALONE_CONTAINER_MAX_BYTES: usize = 512 * 1024;
+
+fn record_limit(role: IndexRunFrameRole, tag: Option<u8>, limits: &IndexRunLimits) -> usize {
+    if role == IndexRunFrameRole::Metadata && tag == Some(2) {
+        STANDALONE_CONTAINER_MAX_BYTES.min(limits.max_frame_bytes)
+    } else {
+        limits.max_record_bytes
+    }
 }
 
-fn decode_payload_header(
+fn encode_payload_layout(writer: &mut Writer, layout: &PayloadLayout) -> Result<(), IndexRunError> {
+    writer.varint(layout.chunk_size)?;
+    writer.varint(layout.plaintext_len)?;
+    writer.string(layout.key_id.as_str(), 255, "content key id")?;
+    writer.bytes(&layout.carrier_id)?;
+    writer.varint(usize_to_u64(layout.parts.len())?)?;
+    for part in &layout.parts {
+        writer.varint(u64::from(part.part_number))?;
+        writer.bytes(part.attempt_id.as_bytes())?;
+        writer.varint(part.plaintext_len)?;
+    }
+    Ok(())
+}
+
+fn decode_payload_layout(
     reader: &mut Reader<'_>,
     limits: &IndexRunLimits,
-) -> Result<PayloadHeaderReference, IndexRunError> {
-    let header = PayloadHeaderReference {
-        chunk_size: reader.varint()?,
-        plaintext_len: reader.varint()?,
-        key_id: reader.typed_string("content key id", limits.max_key_id_bytes, KeyId::new)?,
-        nonce_prefix: {
-            let mut nonce_prefix = [0_u8; 16];
-            nonce_prefix.copy_from_slice(reader.bytes(16)?);
-            nonce_prefix
-        },
-        header_len: reader.varint()?,
+) -> Result<PayloadLayout, IndexRunError> {
+    let chunk_size = reader.varint()?;
+    let plaintext_len = reader.varint()?;
+    let key_id = reader.typed_string("content key id", limits.max_key_id_bytes, KeyId::new)?;
+    let mut carrier_id = [0; 32];
+    carrier_id.copy_from_slice(reader.bytes(32)?);
+    let count = reader.bounded_count("payload part count", crate::MAX_PAYLOAD_PARTS)?;
+    // Require enough remaining bytes before allocating, even for truncated input.
+    if count > reader.remaining.len() / 34 {
+        return Err(IndexRunError::InvalidStandaloneStreamContainer);
+    }
+    let mut parts = Vec::with_capacity(count);
+    for _ in 0..count {
+        parts.push(crate::PayloadPart {
+            part_number: reader.u32_varint()?,
+            attempt_id: decode_attempt_id(reader)?,
+            plaintext_len: reader.varint()?,
+        });
+    }
+    let layout = PayloadLayout {
+        chunk_size,
+        plaintext_len,
+        key_id,
+        carrier_id,
+        parts,
     };
-    validate_payload_header(&header, limits)?;
-    Ok(header)
-}
-
-fn payload_header_encoded_len(header: &PayloadHeaderReference) -> Result<usize, IndexRunError> {
-    varint_len(header.chunk_size)
-        .checked_add(varint_len(header.plaintext_len))
-        .and_then(|value| {
-            value.checked_add(varint_len(usize_to_u64(header.key_id.as_str().len()).ok()?))
-        })
-        .and_then(|value| value.checked_add(header.key_id.as_str().len()))
-        .and_then(|value| value.checked_add(16))
-        .and_then(|value| value.checked_add(varint_len(header.header_len)))
-        .ok_or(IndexRunError::IntegerOverflow)
+    validate_payload_layout(&layout, limits)?;
+    Ok(layout)
 }
 
 /// Decodes and pairs independently authenticated index-run plaintext frames.
@@ -1371,38 +1312,14 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
     })?;
     validate_count("total frame bytes", total_bytes, limits.max_total_bytes)?;
 
+    let mut decoder = IndexRunFrameDecoder::default();
+    let mut metadata_total = None;
     let mut sequence = None;
     let mut mutation_count = None;
-    let mut self_pack = None;
-    let mut self_stream = None;
-    let mut saw_self_payload_fact = false;
-    let mut containers = Vec::new();
-    let mut stream_containers = Vec::new();
-    let mut standalone_stream_containers = Vec::new();
-    let mut namespace_key_ids: Vec<KeyId> = Vec::new();
-    let mut declared_namespace_key_count = None;
-    let mut namespace: Vec<Option<NamespaceProjection>> = Vec::new();
-    let mut mutations: Vec<Option<IndexMutation>> = Vec::new();
-    let mut previous_container = None;
-    let mut previous_stream_container = None;
-    let mut previous_standalone_stream_container = None;
-    let mut saw_stream_container = false;
-    let mut saw_standalone_stream_container = false;
-    let mut saw_namespace_key_id = false;
-    let mut previous_namespace_key = None;
-    let mut previous_listing_key: Option<(LogicalPath, u32)> = None;
-    let mut used_containers = BTreeSet::new();
-    let mut used_stream_containers = BTreeSet::new();
-    let mut used_standalone_stream_containers = BTreeSet::new();
-    let mut used_namespace_key_ids = BTreeSet::new();
-    let mut uses_self_pack = false;
-    let mut self_stream_uses = 0_usize;
     let mut expected_role = IndexRunFrameRole::Metadata;
     let mut expected_role_ordinal = 0_u32;
     let mut role_total = None;
     let mut role_seen = 0_usize;
-    let mut saw_namespace = false;
-    let mut saw_listing = false;
 
     for encoded in frames {
         validate_count(
@@ -1458,254 +1375,14 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
 
         match header.role {
             IndexRunFrameRole::Metadata => {
-                let frame_namespace_key_count = header
-                    .namespace_key_count
-                    .ok_or(IndexRunError::FrameFactsMismatch)?;
-                if frame_namespace_key_count > header.role_record_count
-                    || frame_namespace_key_count
-                        > usize::try_from(header.mutation_count)
-                            .map_err(|_| IndexRunError::IntegerOverflow)?
-                {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                match declared_namespace_key_count {
-                    None => {
-                        declared_namespace_key_count = Some(frame_namespace_key_count);
-                        namespace_key_ids = Vec::with_capacity(frame_namespace_key_count);
-                    }
-                    Some(count) if count == frame_namespace_key_count => {}
-                    Some(_) => return Err(IndexRunError::FrameFactsMismatch),
-                }
-                let frame_self_pack = header.self_pack.ok_or(IndexRunError::FrameFactsMismatch)?;
-                let frame_self_stream = header
-                    .self_stream
-                    .ok_or(IndexRunError::FrameFactsMismatch)?;
-                if saw_self_payload_fact
-                    && (self_pack != frame_self_pack || self_stream != frame_self_stream)
-                {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                self_pack = frame_self_pack;
-                self_stream = frame_self_stream;
-                saw_self_payload_fact = true;
-                for _ in 0..header.frame_record_count {
-                    let mut record = reader.record(limits.max_record_bytes)?;
-                    match record.u8()? {
-                        0 => {
-                            if saw_stream_container
-                                || saw_standalone_stream_container
-                                || saw_namespace_key_id
-                            {
-                                return Err(IndexRunError::InvalidContainerOrder);
-                            }
-                            validate_next_container_count(
-                                &containers,
-                                &stream_containers,
-                                &standalone_stream_containers,
-                                limits,
-                            )?;
-                            let container = decode_container(&mut record, limits)?;
-                            let key = (container.object_id.clone(), container.version_id.clone());
-                            if let Some(previous) = &previous_container {
-                                if previous == &key {
-                                    return Err(IndexRunError::DuplicateContainer);
-                                }
-                                if previous > &key {
-                                    return Err(IndexRunError::InvalidContainerOrder);
-                                }
-                            }
-                            previous_container = Some(key);
-                            containers.push(container);
-                        }
-                        1 => {
-                            if saw_standalone_stream_container || saw_namespace_key_id {
-                                return Err(IndexRunError::InvalidContainerOrder);
-                            }
-                            validate_next_container_count(
-                                &containers,
-                                &stream_containers,
-                                &standalone_stream_containers,
-                                limits,
-                            )?;
-                            saw_stream_container = true;
-                            let container = decode_stream_container(&mut record, limits)?;
-                            let key = (container.object_id.clone(), container.version_id.clone());
-                            if let Some(previous) = &previous_stream_container {
-                                if previous == &key {
-                                    return Err(IndexRunError::DuplicateContainer);
-                                }
-                                if previous > &key {
-                                    return Err(IndexRunError::InvalidContainerOrder);
-                                }
-                            }
-                            previous_stream_container = Some(key);
-                            stream_containers.push(container);
-                        }
-                        2 => {
-                            if saw_namespace_key_id {
-                                return Err(IndexRunError::InvalidContainerOrder);
-                            }
-                            validate_next_container_count(
-                                &containers,
-                                &stream_containers,
-                                &standalone_stream_containers,
-                                limits,
-                            )?;
-                            saw_standalone_stream_container = true;
-                            let container =
-                                decode_standalone_stream_container(&mut record, limits)?;
-                            let key = (container.object_id.clone(), container.version_id.clone());
-                            if let Some(previous) = &previous_standalone_stream_container {
-                                if previous == &key {
-                                    return Err(IndexRunError::DuplicateContainer);
-                                }
-                                if previous > &key {
-                                    return Err(IndexRunError::InvalidContainerOrder);
-                                }
-                            }
-                            previous_standalone_stream_container = Some(key);
-                            standalone_stream_containers.push(container);
-                        }
-                        3 => {
-                            saw_namespace_key_id = true;
-                            let declared = declared_namespace_key_count
-                                .ok_or(IndexRunError::FrameFactsMismatch)?;
-                            if namespace_key_ids.len() >= declared {
-                                return Err(IndexRunError::FrameFactsMismatch);
-                            }
-                            let namespace_key_id = record.typed_string(
-                                "namespace key id",
-                                limits.max_key_id_bytes,
-                                KeyId::new,
-                            )?;
-                            if let Some(previous) = namespace_key_ids.last() {
-                                match previous.cmp(&namespace_key_id) {
-                                    std::cmp::Ordering::Less => {}
-                                    std::cmp::Ordering::Equal => {
-                                        return Err(IndexRunError::DuplicateNamespaceKey);
-                                    }
-                                    std::cmp::Ordering::Greater => {
-                                        return Err(IndexRunError::InvalidNamespaceKeyOrder);
-                                    }
-                                }
-                            }
-                            namespace_key_ids.push(namespace_key_id);
-                        }
-                        value => {
-                            return Err(IndexRunError::InvalidTag {
-                                field: "container type",
-                                value,
-                            });
-                        }
-                    }
-                    record.finish_record()?;
-                }
+                metadata_total = Some(header.role_record_count);
+                decoder.decode_metadata(header, &mut reader, limits)?;
             }
             IndexRunFrameRole::Namespace => {
-                let declared =
-                    declared_namespace_key_count.ok_or(IndexRunError::FrameFactsMismatch)?;
-                if namespace_key_ids.len() != declared {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                if header.role_record_count
-                    != usize::try_from(header.mutation_count)
-                        .map_err(|_| IndexRunError::IntegerOverflow)?
-                {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                if !saw_namespace {
-                    let count = usize::try_from(header.mutation_count)
-                        .map_err(|_| IndexRunError::IntegerOverflow)?;
-                    namespace.resize_with(count, || None);
-                    mutations.resize_with(count, || None);
-                    saw_namespace = true;
-                }
-                for _ in 0..header.frame_record_count {
-                    let mut record = reader.record(limits.max_record_bytes)?;
-                    let ordinal = record.u32_varint()?;
-                    let (projection, namespace_key_ordinal) = decode_namespace_projection(
-                        &mut record,
-                        &namespace_key_ids,
-                        &containers,
-                        self_pack.as_ref(),
-                        &stream_containers,
-                        self_stream.as_ref(),
-                        &standalone_stream_containers,
-                    )?;
-                    used_namespace_key_ids.insert(namespace_key_ordinal);
-                    if let NamespaceProjection::Upsert { payload, .. } = &projection {
-                        match payload {
-                            IndexPayloadPointer::Empty => {}
-                            IndexPayloadPointer::SelfPack { .. } => uses_self_pack = true,
-                            IndexPayloadPointer::ExternalPack {
-                                container_ordinal, ..
-                            } => {
-                                used_containers.insert(*container_ordinal);
-                            }
-                            IndexPayloadPointer::SelfStream => {
-                                self_stream_uses = self_stream_uses.saturating_add(1);
-                            }
-                            IndexPayloadPointer::ExternalStream { container_ordinal } => {
-                                used_stream_containers.insert(*container_ordinal);
-                            }
-                            IndexPayloadPointer::ExternalStandaloneStream { container_ordinal } => {
-                                used_standalone_stream_containers.insert(*container_ordinal);
-                            }
-                        }
-                    }
-                    record.finish_record()?;
-                    let sort_key = (projection.blind_key(), ordinal);
-                    if previous_namespace_key.is_some_and(|previous| previous >= sort_key) {
-                        return Err(IndexRunError::InvalidProjectionOrder {
-                            projection: "namespace",
-                        });
-                    }
-                    previous_namespace_key = Some(sort_key);
-                    let slot = projection_slot(&mut namespace, "namespace", ordinal)?;
-                    if slot.is_some() {
-                        return Err(IndexRunError::DuplicateProjectionOrdinal {
-                            projection: "namespace",
-                            ordinal,
-                        });
-                    }
-                    *slot = Some(projection);
-                }
+                decoder.decode_namespace(header, &mut reader, limits)?;
             }
             IndexRunFrameRole::Listing => {
-                saw_listing = true;
-                if header.role_record_count
-                    != usize::try_from(header.mutation_count)
-                        .map_err(|_| IndexRunError::IntegerOverflow)?
-                {
-                    return Err(IndexRunError::FrameFactsMismatch);
-                }
-                for _ in 0..header.frame_record_count {
-                    let mut record = reader.record(limits.max_record_bytes)?;
-                    let ordinal = record.u32_varint()?;
-                    let listing = decode_listing_projection(&mut record, limits)?;
-                    record.finish_record()?;
-                    let sort_key = (listing.path(), ordinal);
-                    if previous_listing_key
-                        .as_ref()
-                        .is_some_and(|previous| previous >= &sort_key)
-                    {
-                        return Err(IndexRunError::InvalidProjectionOrder {
-                            projection: "listing",
-                        });
-                    }
-                    previous_listing_key = Some(sort_key);
-                    let mutation_slot = projection_slot(&mut mutations, "listing", ordinal)?;
-                    if mutation_slot.is_some() {
-                        return Err(IndexRunError::DuplicateProjectionOrdinal {
-                            projection: "listing",
-                            ordinal,
-                        });
-                    }
-                    let namespace_mutation = projection_slot(&mut namespace, "namespace", ordinal)?
-                        .take()
-                        .ok_or(IndexRunError::ProjectionMismatch { ordinal })?;
-                    *mutation_slot = Some(pair_projections(ordinal, namespace_mutation, listing)?);
-                }
+                decoder.decode_listing(header, &mut reader, limits)?;
             }
         }
         if !reader.is_empty() {
@@ -1717,66 +1394,358 @@ pub fn decode_index_run_frames<B: AsRef<[u8]>>(
     }
     let count = usize::try_from(mutation_count.ok_or(IndexRunError::InvalidFrameOrder)?)
         .map_err(|_| IndexRunError::IntegerOverflow)?;
-    if count > 0 && (!saw_namespace || !saw_listing) {
-        return Err(IndexRunError::InvalidFrameOrder);
-    }
-    if count == 0 && (saw_namespace || saw_listing) {
-        return Err(IndexRunError::FrameFactsMismatch);
-    }
-    let declared_namespace_key_count =
-        declared_namespace_key_count.ok_or(IndexRunError::FrameFactsMismatch)?;
-    if namespace_key_ids.len() != declared_namespace_key_count {
-        return Err(IndexRunError::FrameFactsMismatch);
-    }
-    if containers
-        .len()
-        .checked_add(stream_containers.len())
-        .and_then(|count| count.checked_add(standalone_stream_containers.len()))
-        .and_then(|count| count.checked_add(namespace_key_ids.len()))
-        .ok_or(IndexRunError::IntegerOverflow)?
-        != frames_metadata_total(frames, limits)?
-    {
-        return Err(IndexRunError::FrameFactsMismatch);
+    decoder.finish(
+        sequence.ok_or(IndexRunError::InvalidFrameOrder)?,
+        count,
+        metadata_total,
+    )
+}
+
+#[derive(Default)]
+struct IndexRunFrameDecoder {
+    completion_receipt: Option<crate::completion::CompletionReceipt>,
+    self_pack: Option<IndexRunSelfPack>,
+
+    saw_self_payload_fact: bool,
+    containers: Vec<IndexRunContainer>,
+
+    standalone_stream_containers: Vec<IndexRunStandaloneStreamContainer>,
+    namespace_key_ids: Vec<KeyId>,
+    declared_namespace_key_count: Option<usize>,
+    namespace: Vec<Option<NamespaceProjection>>,
+    mutations: Vec<Option<IndexMutation>>,
+
+    saw_standalone_stream_container: bool,
+    saw_namespace_key_id: bool,
+    previous_namespace_key: Option<(IndexBlindKey, u32)>,
+    previous_listing_key: Option<(LogicalPath, u32)>,
+    used_containers: BTreeSet<u32>,
+
+    used_standalone_stream_containers: BTreeSet<u32>,
+    used_namespace_key_ids: BTreeSet<u32>,
+    uses_self_pack: bool,
+
+    saw_namespace: bool,
+    saw_listing: bool,
+}
+
+impl IndexRunFrameDecoder {
+    fn decode_metadata(
+        &mut self,
+        header: DecodedFrameHeader,
+        reader: &mut Reader<'_>,
+        limits: &IndexRunLimits,
+    ) -> Result<(), IndexRunError> {
+        let frame_namespace_key_count = header
+            .namespace_key_count
+            .ok_or(IndexRunError::FrameFactsMismatch)?;
+        if frame_namespace_key_count > header.role_record_count
+            || frame_namespace_key_count
+                > usize::try_from(header.mutation_count)
+                    .map_err(|_| IndexRunError::IntegerOverflow)?
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        match self.declared_namespace_key_count {
+            None => {
+                self.declared_namespace_key_count = Some(frame_namespace_key_count);
+                self.namespace_key_ids = Vec::with_capacity(frame_namespace_key_count);
+            }
+            Some(count) if count == frame_namespace_key_count => {}
+            Some(_) => return Err(IndexRunError::FrameFactsMismatch),
+        }
+        let frame_self_pack = header.self_pack.ok_or(IndexRunError::FrameFactsMismatch)?;
+        if self.saw_self_payload_fact && self.self_pack != frame_self_pack {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        self.self_pack = frame_self_pack;
+        self.saw_self_payload_fact = true;
+        for _ in 0..header.frame_record_count {
+            if self.completion_receipt.is_some() {
+                return Err(IndexRunError::InvalidContainerOrder);
+            }
+            let mut record = reader.record(
+                STANDALONE_CONTAINER_MAX_BYTES
+                    .min(limits.max_frame_bytes)
+                    .max(limits.max_record_bytes),
+            )?;
+            let tag = record.remaining.first().copied();
+            validate_count(
+                "metadata record bytes",
+                record.remaining.len(),
+                record_limit(IndexRunFrameRole::Metadata, tag, limits),
+            )?;
+            match record.u8()? {
+                0 => {
+                    if self.saw_standalone_stream_container || self.saw_namespace_key_id {
+                        return Err(IndexRunError::InvalidContainerOrder);
+                    }
+                    validate_next_container_count(
+                        &self.containers,
+                        &self.standalone_stream_containers,
+                        limits,
+                    )?;
+                    let container = decode_container(&mut record, limits)?;
+                    validate_container_order(
+                        self.containers
+                            .last()
+                            .map(|previous| (&previous.object_id, &previous.version_id)),
+                        (&container.object_id, &container.version_id),
+                    )?;
+                    self.containers.push(container);
+                }
+                2 => {
+                    if self.saw_namespace_key_id {
+                        return Err(IndexRunError::InvalidContainerOrder);
+                    }
+                    validate_next_container_count(
+                        &self.containers,
+                        &self.standalone_stream_containers,
+                        limits,
+                    )?;
+                    self.saw_standalone_stream_container = true;
+                    let container = decode_standalone_stream_container(&mut record, limits)?;
+                    validate_container_order(
+                        self.standalone_stream_containers
+                            .last()
+                            .map(|previous| (&previous.object_id, &previous.version_id)),
+                        (&container.object_id, &container.version_id),
+                    )?;
+                    self.standalone_stream_containers.push(container);
+                }
+                3 => {
+                    self.saw_namespace_key_id = true;
+                    let declared = self
+                        .declared_namespace_key_count
+                        .ok_or(IndexRunError::FrameFactsMismatch)?;
+                    if self.namespace_key_ids.len() >= declared {
+                        return Err(IndexRunError::FrameFactsMismatch);
+                    }
+                    let namespace_key_id = record.typed_string(
+                        "namespace key id",
+                        limits.max_key_id_bytes,
+                        KeyId::new,
+                    )?;
+                    if let Some(previous) = self.namespace_key_ids.last() {
+                        match previous.cmp(&namespace_key_id) {
+                            std::cmp::Ordering::Less => {}
+                            std::cmp::Ordering::Equal => {
+                                return Err(IndexRunError::DuplicateNamespaceKey);
+                            }
+                            std::cmp::Ordering::Greater => {
+                                return Err(IndexRunError::InvalidNamespaceKeyOrder);
+                            }
+                        }
+                    }
+                    self.namespace_key_ids.push(namespace_key_id);
+                }
+                4 => {
+                    self.completion_receipt = Some(
+                        crate::completion::CompletionReceipt::decode(record.remaining)
+                            .map_err(|_| IndexRunError::FrameFactsMismatch)?,
+                    );
+                    record.remaining = &[];
+                }
+                value => {
+                    return Err(IndexRunError::InvalidTag {
+                        field: "container type",
+                        value,
+                    });
+                }
+            }
+            record.finish_record()?;
+        }
+        Ok(())
     }
 
-    validate_distinct_container_objects(
-        &containers,
-        &stream_containers,
-        &standalone_stream_containers,
-    )?;
+    fn decode_namespace(
+        &mut self,
+        header: DecodedFrameHeader,
+        reader: &mut Reader<'_>,
+        limits: &IndexRunLimits,
+    ) -> Result<(), IndexRunError> {
+        let declared = self
+            .declared_namespace_key_count
+            .ok_or(IndexRunError::FrameFactsMismatch)?;
+        if self.namespace_key_ids.len() != declared {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        if header.role_record_count
+            != usize::try_from(header.mutation_count).map_err(|_| IndexRunError::IntegerOverflow)?
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        if !self.saw_namespace {
+            let count = usize::try_from(header.mutation_count)
+                .map_err(|_| IndexRunError::IntegerOverflow)?;
+            self.namespace.resize_with(count, || None);
+            self.mutations.resize_with(count, || None);
+            self.saw_namespace = true;
+        }
+        for _ in 0..header.frame_record_count {
+            let mut record = reader.record(limits.max_record_bytes)?;
+            let ordinal = record.u32_varint()?;
+            let (projection, namespace_key_ordinal) = decode_namespace_projection(
+                &mut record,
+                &self.namespace_key_ids,
+                &self.containers,
+                self.self_pack.as_ref(),
+                &self.standalone_stream_containers,
+            )?;
+            self.used_namespace_key_ids.insert(namespace_key_ordinal);
+            if let NamespaceProjection::Upsert { payload, .. } = &projection {
+                match payload {
+                    IndexPayloadPointer::Empty => {}
+                    IndexPayloadPointer::SelfPack { .. } => self.uses_self_pack = true,
+                    IndexPayloadPointer::ExternalPack {
+                        container_ordinal, ..
+                    } => {
+                        self.used_containers.insert(*container_ordinal);
+                    }
 
-    validate_container_use(
-        containers.len(),
-        &used_containers,
-        uses_self_pack,
-        self_pack.as_ref(),
-    )?;
-    validate_stream_container_use(
-        stream_containers.len(),
-        &used_stream_containers,
-        self_stream_uses,
-        self_stream.as_ref(),
-    )?;
-    validate_standalone_stream_container_use(
-        standalone_stream_containers.len(),
-        &used_standalone_stream_containers,
-    )?;
-    validate_namespace_key_use(namespace_key_ids.len(), &used_namespace_key_ids)?;
-    let mut ordered_mutations = Vec::with_capacity(mutations.len());
-    for (index, mutation) in mutations.into_iter().enumerate() {
-        let ordinal = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
-        ordered_mutations.push(mutation.ok_or(IndexRunError::ProjectionMismatch { ordinal })?);
+                    IndexPayloadPointer::ExternalStandaloneStream { container_ordinal } => {
+                        self.used_standalone_stream_containers
+                            .insert(*container_ordinal);
+                    }
+                }
+            }
+            record.finish_record()?;
+            let sort_key = (projection.blind_key(), ordinal);
+            if self
+                .previous_namespace_key
+                .is_some_and(|previous| previous >= sort_key)
+            {
+                return Err(IndexRunError::InvalidProjectionOrder {
+                    projection: "namespace",
+                });
+            }
+            self.previous_namespace_key = Some(sort_key);
+            let slot = projection_slot(&mut self.namespace, "namespace", ordinal)?;
+            if slot.is_some() {
+                return Err(IndexRunError::DuplicateProjectionOrdinal {
+                    projection: "namespace",
+                    ordinal,
+                });
+            }
+            *slot = Some(projection);
+        }
+        Ok(())
     }
-    validate_repeated_record_facts(&ordered_mutations, self_pack.as_ref(), &containers)?;
-    Ok(IndexRun {
-        sequence: sequence.ok_or(IndexRunError::InvalidFrameOrder)?,
-        self_pack,
-        self_stream,
-        containers,
-        stream_containers,
-        standalone_stream_containers,
-        mutations: ordered_mutations,
-    })
+
+    fn decode_listing(
+        &mut self,
+        header: DecodedFrameHeader,
+        reader: &mut Reader<'_>,
+        limits: &IndexRunLimits,
+    ) -> Result<(), IndexRunError> {
+        self.saw_listing = true;
+        if header.role_record_count
+            != usize::try_from(header.mutation_count).map_err(|_| IndexRunError::IntegerOverflow)?
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        let mut previous_path: Option<LogicalPath> = None;
+        for _ in 0..header.frame_record_count {
+            let mut record = reader.record(limits.max_record_bytes)?;
+            let path = decode_listing_path(
+                &mut record,
+                previous_path
+                    .as_ref()
+                    .map_or(&[], |path| path.as_str().as_bytes()),
+                limits,
+            )?;
+            previous_path = Some(path.clone());
+            let ordinal = record.u32_varint()?;
+            let listing = decode_listing_projection(&mut record, path)?;
+            record.finish_record()?;
+            let sort_key = (listing.path(), ordinal);
+            if self
+                .previous_listing_key
+                .as_ref()
+                .is_some_and(|previous| previous >= &sort_key)
+            {
+                return Err(IndexRunError::InvalidProjectionOrder {
+                    projection: "listing",
+                });
+            }
+            self.previous_listing_key = Some(sort_key);
+            let mutation_slot = projection_slot(&mut self.mutations, "listing", ordinal)?;
+            if mutation_slot.is_some() {
+                return Err(IndexRunError::DuplicateProjectionOrdinal {
+                    projection: "listing",
+                    ordinal,
+                });
+            }
+            let namespace_mutation = projection_slot(&mut self.namespace, "namespace", ordinal)?
+                .take()
+                .ok_or(IndexRunError::ProjectionMismatch { ordinal })?;
+            *mutation_slot = Some(pair_projections(ordinal, namespace_mutation, listing)?);
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        sequence: Sequence,
+        count: usize,
+        metadata_total: Option<usize>,
+    ) -> Result<IndexRun, IndexRunError> {
+        if count > 0 && (!self.saw_namespace || !self.saw_listing) {
+            return Err(IndexRunError::InvalidFrameOrder);
+        }
+        if count == 0 && (self.saw_namespace || self.saw_listing) {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        let declared = self
+            .declared_namespace_key_count
+            .ok_or(IndexRunError::FrameFactsMismatch)?;
+        if self.namespace_key_ids.len() != declared {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        if self
+            .containers
+            .len()
+            .checked_add(self.standalone_stream_containers.len())
+            .and_then(|count| count.checked_add(self.namespace_key_ids.len()))
+            .and_then(|count| count.checked_add(usize::from(self.completion_receipt.is_some())))
+            .ok_or(IndexRunError::IntegerOverflow)?
+            != metadata_total.ok_or(IndexRunError::InvalidFrameOrder)?
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+
+        validate_distinct_container_objects(&self.containers, &self.standalone_stream_containers)?;
+
+        validate_container_use(
+            self.containers.len(),
+            &self.used_containers,
+            self.uses_self_pack,
+            self.self_pack.as_ref(),
+        )?;
+        validate_standalone_stream_container_use(
+            self.standalone_stream_containers.len(),
+            &self.used_standalone_stream_containers,
+        )?;
+        validate_namespace_key_use(self.namespace_key_ids.len(), &self.used_namespace_key_ids)?;
+        let mut ordered_mutations = Vec::with_capacity(self.mutations.len());
+        for (index, mutation) in self.mutations.into_iter().enumerate() {
+            let ordinal = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
+            ordered_mutations.push(mutation.ok_or(IndexRunError::ProjectionMismatch { ordinal })?);
+        }
+        validate_repeated_record_facts(&ordered_mutations)?;
+        let run = IndexRun {
+            completion_receipt: self.completion_receipt,
+            sequence,
+            self_pack: self.self_pack,
+
+            containers: self.containers,
+
+            standalone_stream_containers: self.standalone_stream_containers,
+            mutations: ordered_mutations,
+        };
+        validate_completion_receipt(&run)?;
+        Ok(run)
+    }
 }
 
 struct DecodedFrameHeader {
@@ -1787,7 +1756,7 @@ struct DecodedFrameHeader {
     role_record_count: usize,
     frame_record_count: usize,
     self_pack: Option<Option<IndexRunSelfPack>>,
-    self_stream: Option<Option<IndexRunSelfStream>>,
+
     namespace_key_count: Option<usize>,
 }
 
@@ -1814,50 +1783,40 @@ fn decode_frame_header<'a>(
             });
         }
     };
-    let role_ordinal = reader.u32()?;
+    let role_ordinal = reader.u32_varint()?;
     let sequence = Sequence::new(reader.u64()?);
     let mutation_count = reader.u32_varint()?;
     let role_record_limit = if role == IndexRunFrameRole::Metadata {
         limits
             .max_containers
             .checked_add(limits.max_mutations)
+            .and_then(|count| count.checked_add(1)) // Optional completion receipt.
             .ok_or(IndexRunError::IntegerOverflow)?
     } else {
         limits.max_mutations
     };
     let role_record_count = reader.bounded_count("role record count", role_record_limit)?;
     let frame_record_count = reader.bounded_count("frame record count", role_record_limit)?;
-    let (self_pack, self_stream, namespace_key_count) = if role == IndexRunFrameRole::Metadata {
-        let (self_pack, self_stream) = match reader.u8()? {
-            0 => (Some(None), Some(None)),
+    let (self_pack, namespace_key_count) = if role == IndexRunFrameRole::Metadata {
+        let self_pack = match reader.u8()? {
+            0 => Some(None),
             1 => {
                 let mut pack_id = [0_u8; 32];
                 pack_id.copy_from_slice(reader.bytes(32)?);
+                let attempt_id = decode_attempt_id(&mut reader)?;
                 let content_key_id =
                     reader.typed_string("content key id", limits.max_key_id_bytes, KeyId::new)?;
                 let stored_len = reader.u64()?;
                 let record_count = reader.u32_varint()?;
                 let pack = IndexRunSelfPack {
                     pack_id,
+                    attempt_id,
                     content_key_id,
                     stored_len,
                     record_count,
                 };
                 validate_self_pack(Some(&pack), limits)?;
-                (Some(Some(pack)), Some(None))
-            }
-            2 => {
-                let stream = IndexRunSelfStream {
-                    payload_section_ordinal: reader.u32()?,
-                    payload_id: reader.typed_string(
-                        "payload id",
-                        limits.max_object_id_bytes,
-                        BackendObjectId::new,
-                    )?,
-                    payload_header: decode_payload_header(&mut reader, limits)?,
-                };
-                validate_self_stream(Some(&stream), limits)?;
-                (Some(None), Some(Some(stream)))
+                Some(Some(pack))
             }
             value => {
                 return Err(IndexRunError::InvalidTag {
@@ -1868,9 +1827,9 @@ fn decode_frame_header<'a>(
         };
         let namespace_key_count =
             reader.bounded_count("namespace key count", limits.max_mutations)?;
-        (self_pack, self_stream, Some(namespace_key_count))
+        (self_pack, Some(namespace_key_count))
     } else {
-        (None, None, None)
+        (None, None)
     };
     Ok((
         DecodedFrameHeader {
@@ -1881,24 +1840,19 @@ fn decode_frame_header<'a>(
             role_record_count,
             frame_record_count,
             self_pack,
-            self_stream,
+
             namespace_key_count,
         },
         reader,
     ))
 }
 
-fn frames_metadata_total<B: AsRef<[u8]>>(
-    frames: &[B],
-    limits: &IndexRunLimits,
-) -> Result<usize, IndexRunError> {
-    for frame in frames {
-        let (header, _) = decode_frame_header(frame.as_ref(), limits)?;
-        if header.role == IndexRunFrameRole::Metadata {
-            return Ok(header.role_record_count);
-        }
-    }
-    Err(IndexRunError::InvalidFrameOrder)
+fn decode_attempt_id(
+    reader: &mut Reader<'_>,
+) -> Result<rs3_types::PayloadAttemptId, IndexRunError> {
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(reader.bytes(32)?);
+    Ok(rs3_types::PayloadAttemptId::from_bytes(bytes))
 }
 
 fn decode_container(
@@ -1912,7 +1866,7 @@ fn decode_container(
         stored_len: exact.stored_len,
         commit_body_digest: exact.object_digest,
         keyring_envelope: exact.keyring_envelope,
-        pack_section_ordinal: record.u32()?,
+        pack_section_ordinal: record.u32_varint()?,
         pack_section_offset: record.u64()?,
         pack_section_len: record.u64()?,
         pack_id: {
@@ -1920,6 +1874,7 @@ fn decode_container(
             pack_id.copy_from_slice(record.bytes(32)?);
             pack_id
         },
+        attempt_id: decode_attempt_id(record)?,
         content_key_id: record.typed_string(
             "content key id",
             limits.max_key_id_bytes,
@@ -1928,41 +1883,6 @@ fn decode_container(
         pack_record_count: record.u32_varint()?,
     };
     validate_container_range(&container)?;
-    Ok(container)
-}
-
-fn decode_stream_container(
-    record: &mut Reader<'_>,
-    limits: &IndexRunLimits,
-) -> Result<IndexRunStreamContainer, IndexRunError> {
-    let exact = decode_exact_container(record, limits)?;
-    let sections_start = record.u64()?;
-    let payload_section_ordinal = record.u32()?;
-    let payload_section_offset = record.u64()?;
-    let payload_section_len = record.u64()?;
-    let mut payload_section_digest = [0_u8; 32];
-    payload_section_digest.copy_from_slice(record.bytes(32)?);
-    let payload_id = record.typed_string(
-        "payload id",
-        limits.max_object_id_bytes,
-        BackendObjectId::new,
-    )?;
-    let payload_header = decode_payload_header(record, limits)?;
-    let container = IndexRunStreamContainer {
-        object_id: exact.object_id,
-        version_id: exact.version_id,
-        stored_len: exact.stored_len,
-        commit_body_digest: exact.object_digest,
-        keyring_envelope: exact.keyring_envelope,
-        sections_start,
-        payload_section_ordinal,
-        payload_section_offset,
-        payload_section_len,
-        payload_section_digest,
-        payload_id,
-        payload_header,
-    };
-    validate_stream_container(&container, limits)?;
     Ok(container)
 }
 
@@ -1977,7 +1897,7 @@ fn decode_standalone_stream_container(
         stored_len: exact.stored_len,
         object_digest: exact.object_digest,
         keyring_envelope: exact.keyring_envelope,
-        payload_header: decode_payload_header(record, limits)?,
+        payload_layout: decode_payload_layout(record, limits)?,
     };
     validate_standalone_stream_container(&container, limits)?;
     Ok(container)
@@ -2041,8 +1961,7 @@ fn decode_namespace_projection(
     namespace_key_ids: &[KeyId],
     containers: &[IndexRunContainer],
     self_pack: Option<&IndexRunSelfPack>,
-    stream_containers: &[IndexRunStreamContainer],
-    self_stream: Option<&IndexRunSelfStream>,
+
     standalone_stream_containers: &[IndexRunStandaloneStreamContainer],
 ) -> Result<(NamespaceProjection, u32), IndexRunError> {
     match record.u8()? {
@@ -2055,8 +1974,6 @@ fn decode_namespace_projection(
                 record,
                 containers,
                 self_pack,
-                stream_containers,
-                self_stream,
                 standalone_stream_containers,
             )?;
             let content_len = record.varint()?;
@@ -2066,8 +1983,6 @@ fn decode_namespace_projection(
                 content_len,
                 self_pack,
                 containers,
-                self_stream,
-                stream_containers,
                 standalone_stream_containers,
             )?;
             Ok((
@@ -2080,6 +1995,8 @@ fn decode_namespace_projection(
                     modified_at_ms: record.i64()?,
                     retention: decode_retention(record)?,
                     legal_hold: decode_legal_hold(record)?,
+                    checksum: decode_checksum(record)?,
+                    etag: decode_etag(record)?,
                 },
                 namespace_key_ordinal,
             ))
@@ -2117,12 +2034,46 @@ fn decode_namespace_key_reference(
     Ok((ordinal, namespace_key_id))
 }
 
+fn decode_listing_path(
+    record: &mut Reader<'_>,
+    previous: &[u8],
+    limits: &IndexRunLimits,
+) -> Result<LogicalPath, IndexRunError> {
+    let prefix_len = record.bounded_count("logical path", limits.max_path_bytes)?;
+    let prefix = previous
+        .get(..prefix_len)
+        .ok_or(IndexRunError::InvalidPathPrefix)?;
+    let suffix_len = record.bounded_count("logical path", limits.max_path_bytes)?;
+    let path_len = prefix_len
+        .checked_add(suffix_len)
+        .ok_or(IndexRunError::IntegerOverflow)?;
+    validate_count("logical path", path_len, limits.max_path_bytes)?;
+    let suffix = record.bytes(suffix_len)?;
+    // A byte prefix may end within a UTF-8 code point. Validate the reconstructed
+    // path, and reject a shorter representation of the same shared prefix.
+    if previous
+        .get(prefix_len)
+        .zip(suffix.first())
+        .is_some_and(|(a, b)| a == b)
+    {
+        return Err(IndexRunError::InvalidPathPrefix);
+    }
+    let mut path = Vec::with_capacity(path_len);
+    path.extend_from_slice(prefix);
+    path.extend_from_slice(suffix);
+    let path = String::from_utf8(path).map_err(|_| IndexRunError::InvalidUtf8 {
+        field: "logical path",
+    })?;
+    LogicalPath::new(path).map_err(|_| IndexRunError::InvalidValue {
+        field: "logical path",
+    })
+}
+
 fn decode_listing_projection(
     record: &mut Reader<'_>,
-    limits: &IndexRunLimits,
+    path: LogicalPath,
 ) -> Result<ListingProjection, IndexRunError> {
     let tag = record.u8()?;
-    let path = record.typed_string("logical path", limits.max_path_bytes, LogicalPath::new)?;
     let generation = Sequence::new(record.varint()?);
     match tag {
         0 => Ok(ListingProjection::Upsert {
@@ -2155,6 +2106,8 @@ fn pair_projections(
                 modified_at_ms: namespace_modified_at_ms,
                 retention,
                 legal_hold,
+                checksum,
+                etag,
             },
             ListingProjection::Upsert {
                 path,
@@ -2177,6 +2130,8 @@ fn pair_projections(
                 modified_at_ms,
                 retention,
                 legal_hold,
+                etag,
+                checksum,
             }))
         }
         (
@@ -2218,14 +2173,13 @@ fn validate_container_use(
 
 fn validate_next_container_count(
     containers: &[IndexRunContainer],
-    stream_containers: &[IndexRunStreamContainer],
+
     standalone_stream_containers: &[IndexRunStandaloneStreamContainer],
     limits: &IndexRunLimits,
 ) -> Result<(), IndexRunError> {
     let actual = containers
         .len()
-        .checked_add(stream_containers.len())
-        .and_then(|count| count.checked_add(standalone_stream_containers.len()))
+        .checked_add(standalone_stream_containers.len())
         .and_then(|count| count.checked_add(1))
         .ok_or(IndexRunError::IntegerOverflow)?;
     validate_count("container count", actual, limits.max_containers)
@@ -2239,24 +2193,6 @@ fn validate_namespace_key_use(
         let ordinal = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
         if !used_namespace_key_ids.contains(&ordinal) {
             return Err(IndexRunError::UnusedNamespaceKey(ordinal));
-        }
-    }
-    Ok(())
-}
-
-fn validate_stream_container_use(
-    container_count: usize,
-    used_containers: &BTreeSet<u32>,
-    self_stream_uses: usize,
-    self_stream: Option<&IndexRunSelfStream>,
-) -> Result<(), IndexRunError> {
-    if (self_stream_uses > 0) != self_stream.is_some() {
-        return Err(IndexRunError::InvalidSelfStream);
-    }
-    for index in 0..container_count {
-        let ordinal = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
-        if !used_containers.contains(&ordinal) {
-            return Err(IndexRunError::UnusedStreamContainer(ordinal));
         }
     }
     Ok(())
@@ -2310,6 +2246,8 @@ enum NamespaceProjection {
         modified_at_ms: i64,
         retention: Option<RetentionPolicy>,
         legal_hold: Option<LegalHoldStatus>,
+        checksum: Option<ObjectChecksum>,
+        etag: ObjectEtag,
     },
     Tombstone {
         blind_key: IndexBlindKey,
@@ -2405,6 +2343,17 @@ fn validate_count(field: &'static str, actual: usize, maximum: usize) -> Result<
     Ok(())
 }
 
+fn validate_container_order(
+    previous: Option<(&BackendObjectId, &Option<BackendVersionId>)>,
+    key: (&BackendObjectId, &Option<BackendVersionId>),
+) -> Result<(), IndexRunError> {
+    match previous.map(|previous| previous.cmp(&key)) {
+        Some(std::cmp::Ordering::Equal) => Err(IndexRunError::DuplicateContainer),
+        Some(std::cmp::Ordering::Greater) => Err(IndexRunError::InvalidContainerOrder),
+        _ => Ok(()),
+    }
+}
+
 fn validate_containers(
     containers: &[IndexRunContainer],
     limits: &IndexRunLimits,
@@ -2435,41 +2384,7 @@ fn validate_containers(
         )?;
         validate_container_range(container)?;
         let key = (&container.object_id, &container.version_id);
-        if let Some(previous_key) = previous {
-            if previous_key == key {
-                return Err(IndexRunError::DuplicateContainer);
-            }
-            if previous_key > key {
-                return Err(IndexRunError::InvalidContainerOrder);
-            }
-        }
-        previous = Some(key);
-    }
-    Ok(())
-}
-
-fn validate_stream_containers(
-    containers: &[IndexRunStreamContainer],
-    limits: &IndexRunLimits,
-) -> Result<(), IndexRunError> {
-    let mut previous = None;
-    for container in containers {
-        validate_exact_container(
-            &container.object_id,
-            container.version_id.as_ref(),
-            &container.keyring_envelope,
-            limits,
-        )?;
-        validate_stream_container(container, limits)?;
-        let key = (&container.object_id, &container.version_id);
-        if let Some(previous_key) = previous {
-            if previous_key == key {
-                return Err(IndexRunError::DuplicateContainer);
-            }
-            if previous_key > key {
-                return Err(IndexRunError::InvalidContainerOrder);
-            }
-        }
+        validate_container_order(previous, key)?;
         previous = Some(key);
     }
     Ok(())
@@ -2489,14 +2404,7 @@ fn validate_standalone_stream_containers(
         )?;
         validate_standalone_stream_container(container, limits)?;
         let key = (&container.object_id, &container.version_id);
-        if let Some(previous_key) = previous {
-            if previous_key == key {
-                return Err(IndexRunError::DuplicateContainer);
-            }
-            if previous_key > key {
-                return Err(IndexRunError::InvalidContainerOrder);
-            }
-        }
+        validate_container_order(previous, key)?;
         previous = Some(key);
     }
     Ok(())
@@ -2504,18 +2412,12 @@ fn validate_standalone_stream_containers(
 
 fn validate_distinct_container_objects(
     pack: &[IndexRunContainer],
-    stream: &[IndexRunStreamContainer],
     standalone_stream: &[IndexRunStandaloneStreamContainer],
 ) -> Result<(), IndexRunError> {
     let mut exact = BTreeSet::new();
     for key in pack
         .iter()
         .map(|container| (&container.object_id, &container.version_id))
-        .chain(
-            stream
-                .iter()
-                .map(|container| (&container.object_id, &container.version_id)),
-        )
         .chain(
             standalone_stream
                 .iter()
@@ -2592,56 +2494,13 @@ fn validate_self_pack(
     Ok(())
 }
 
-fn validate_self_stream(
-    self_stream: Option<&IndexRunSelfStream>,
-    limits: &IndexRunLimits,
-) -> Result<(), IndexRunError> {
-    let Some(stream) = self_stream else {
-        return Ok(());
-    };
-    validate_count(
-        "payload id",
-        stream.payload_id.as_str().len(),
-        limits.max_object_id_bytes,
-    )?;
-    validate_payload_header(&stream.payload_header, limits)
-        .map_err(|_| IndexRunError::InvalidSelfStream)
-}
-
-fn validate_stream_container(
-    container: &IndexRunStreamContainer,
-    limits: &IndexRunLimits,
-) -> Result<(), IndexRunError> {
-    validate_count(
-        "payload id",
-        container.payload_id.as_str().len(),
-        limits.max_object_id_bytes,
-    )?;
-    validate_payload_header(&container.payload_header, limits)?;
-    let section_start = container
-        .sections_start
-        .checked_add(container.payload_section_offset)
-        .ok_or(IndexRunError::InvalidStreamContainer)?;
-    let section_end = section_start
-        .checked_add(container.payload_section_len)
-        .ok_or(IndexRunError::InvalidStreamContainer)?;
-    if container.sections_start == 0
-        || container.payload_section_len == 0
-        || section_end > container.stored_len
-        || stream_payload_stored_len(&container.payload_header)? != container.payload_section_len
-    {
-        return Err(IndexRunError::InvalidStreamContainer);
-    }
-    Ok(())
-}
-
 fn validate_standalone_stream_container(
     container: &IndexRunStandaloneStreamContainer,
     limits: &IndexRunLimits,
 ) -> Result<(), IndexRunError> {
-    validate_payload_header(&container.payload_header, limits)
+    validate_payload_layout(&container.payload_layout, limits)
         .map_err(|_| IndexRunError::InvalidStandaloneStreamContainer)?;
-    if stream_payload_stored_len(&container.payload_header)
+    if stream_payload_stored_len(&container.payload_layout)
         .map_err(|_| IndexRunError::InvalidStandaloneStreamContainer)?
         != container.stored_len
     {
@@ -2650,8 +2509,8 @@ fn validate_standalone_stream_container(
     Ok(())
 }
 
-fn validate_payload_header(
-    header: &PayloadHeaderReference,
+fn validate_payload_layout(
+    header: &PayloadLayout,
     limits: &IndexRunLimits,
 ) -> Result<(), IndexRunError> {
     validate_count(
@@ -2659,34 +2518,59 @@ fn validate_payload_header(
         header.key_id.as_str().len(),
         limits.max_key_id_bytes,
     )?;
-    if header.chunk_size == 0
-        || header.header_len == 0
-        || header.header_len > INDEX_STREAM_MAX_HEADER_BYTES
-    {
-        return Err(IndexRunError::InvalidStreamContainer);
-    }
-    stream_payload_stored_len(header).map(|_| ())
+    header
+        .stored_len()
+        .ok_or(IndexRunError::InvalidStandaloneStreamContainer)
+        .map(|_| ())
 }
 
-fn stream_payload_stored_len(header: &PayloadHeaderReference) -> Result<u64, IndexRunError> {
-    let segment_count = header.plaintext_len.div_ceil(header.chunk_size);
+fn stream_payload_stored_len(header: &PayloadLayout) -> Result<u64, IndexRunError> {
     header
-        .plaintext_len
-        .checked_add(
-            segment_count
-                .checked_mul(INDEX_STREAM_SEGMENT_TAG_BYTES)
-                .ok_or(IndexRunError::InvalidStreamContainer)?,
-        )
-        .and_then(|ciphertext_len| header.header_len.checked_add(ciphertext_len))
-        .ok_or(IndexRunError::InvalidStreamContainer)
+        .stored_len()
+        .ok_or(IndexRunError::InvalidStandaloneStreamContainer)
+}
+
+fn validate_completion_receipt(run: &IndexRun) -> Result<(), IndexRunError> {
+    if let Some(receipt) = &run.completion_receipt {
+        receipt
+            .validate()
+            .map_err(|_| IndexRunError::FrameFactsMismatch)?;
+        let mut upserts = run.mutations.iter().filter_map(|mutation| match mutation {
+            IndexMutation::Upsert(upsert) => Some(upsert),
+            IndexMutation::Tombstone(_) => None,
+        });
+        let upsert = upserts.next().ok_or(IndexRunError::FrameFactsMismatch)?;
+        if upserts.next().is_some()
+            || upsert.path != receipt.key
+            || upsert.content_len != receipt.content_len
+            || upsert.etag != receipt.etag
+            || upsert.checksum != receipt.checksum
+        {
+            return Err(IndexRunError::FrameFactsMismatch);
+        }
+        // One logical overwrite can retire the same path under old namespace
+        // keys. The receipt must not authorize any unrelated mutation.
+        let mut namespaces = BTreeSet::from([&upsert.namespace_key_id]);
+        let mut blind_keys = BTreeSet::from([upsert.blind_key]);
+        for mutation in &run.mutations {
+            if let IndexMutation::Tombstone(tombstone) = mutation
+                && (tombstone.path != upsert.path
+                    || tombstone.generation != upsert.generation
+                    || !namespaces.insert(&tombstone.namespace_key_id)
+                    || !blind_keys.insert(tombstone.blind_key))
+            {
+                return Err(IndexRunError::FrameFactsMismatch);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_mutations(run: &IndexRun, limits: &IndexRunLimits) -> Result<(), IndexRunError> {
+    validate_completion_receipt(run)?;
     let mut used_containers = BTreeSet::new();
-    let mut used_stream_containers = BTreeSet::new();
     let mut used_standalone_stream_containers = BTreeSet::new();
     let mut uses_self_pack = false;
-    let mut self_stream_uses = 0_usize;
     for (index, mutation) in run.mutations.iter().enumerate() {
         let expected = u32::try_from(index).map_err(|_| IndexRunError::IntegerOverflow)?;
         let actual = mutation.ordinal();
@@ -2706,13 +2590,17 @@ fn validate_mutations(run: &IndexRun, limits: &IndexRunLimits) -> Result<(), Ind
                     limits.max_path_bytes,
                 )?;
                 validate_empty_payload(upsert.payload, upsert.content_len)?;
+                if let Some(checksum) = upsert.checksum.as_ref()
+                    && let ChecksumType::Composite { parts } = checksum.kind()
+                    && upsert.etag.part_count() != Some(parts)
+                {
+                    return Err(IndexRunError::FrameFactsMismatch);
+                }
                 validate_payload_pointer(
                     upsert.payload,
                     upsert.content_len,
                     run.self_pack.as_ref(),
                     &run.containers,
-                    run.self_stream.as_ref(),
-                    &run.stream_containers,
                     &run.standalone_stream_containers,
                 )?;
                 match upsert.payload {
@@ -2740,13 +2628,7 @@ fn validate_mutations(run: &IndexRun, limits: &IndexRunLimits) -> Result<(), Ind
                         }
                         used_containers.insert(container_ordinal);
                     }
-                    IndexPayloadPointer::SelfStream => {
-                        self_stream_uses = self_stream_uses.saturating_add(1);
-                    }
-                    IndexPayloadPointer::ExternalStream { container_ordinal } => {
-                        validate_container_ordinal(container_ordinal, run.stream_containers.len())?;
-                        used_stream_containers.insert(container_ordinal);
-                    }
+
                     IndexPayloadPointer::ExternalStandaloneStream { container_ordinal } => {
                         validate_container_ordinal(
                             container_ordinal,
@@ -2776,17 +2658,11 @@ fn validate_mutations(run: &IndexRun, limits: &IndexRunLimits) -> Result<(), Ind
         uses_self_pack,
         run.self_pack.as_ref(),
     )?;
-    validate_stream_container_use(
-        run.stream_containers.len(),
-        &used_stream_containers,
-        self_stream_uses,
-        run.self_stream.as_ref(),
-    )?;
     validate_standalone_stream_container_use(
         run.standalone_stream_containers.len(),
         &used_standalone_stream_containers,
     )?;
-    validate_repeated_record_facts(&run.mutations, run.self_pack.as_ref(), &run.containers)
+    validate_repeated_record_facts(&run.mutations)
 }
 
 fn validate_empty_payload(
@@ -2795,9 +2671,7 @@ fn validate_empty_payload(
 ) -> Result<(), IndexRunError> {
     match pointer {
         IndexPayloadPointer::Empty if content_len == 0 => Ok(()),
-        IndexPayloadPointer::SelfStream
-        | IndexPayloadPointer::ExternalStream { .. }
-        | IndexPayloadPointer::ExternalStandaloneStream { .. } => Ok(()),
+        IndexPayloadPointer::ExternalStandaloneStream { .. } => Ok(()),
         IndexPayloadPointer::SelfPack { .. } | IndexPayloadPointer::ExternalPack { .. }
             if content_len != 0 =>
         {
@@ -2812,8 +2686,7 @@ fn validate_payload_pointer(
     content_len: u64,
     self_pack: Option<&IndexRunSelfPack>,
     containers: &[IndexRunContainer],
-    self_stream: Option<&IndexRunSelfStream>,
-    stream_containers: &[IndexRunStreamContainer],
+
     standalone_stream_containers: &[IndexRunStandaloneStreamContainer],
 ) -> Result<(), IndexRunError> {
     let (record, pack_stored_len) = match pointer {
@@ -2833,27 +2706,12 @@ fn validate_payload_pointer(
                 [usize::try_from(container_ordinal).map_err(|_| IndexRunError::IntegerOverflow)?];
             (record, container.pack_section_len)
         }
-        IndexPayloadPointer::SelfStream => {
-            let stream = self_stream.ok_or(IndexRunError::InvalidSelfStream)?;
-            if stream.payload_header.plaintext_len != content_len {
-                return Err(IndexRunError::InvalidSelfStream);
-            }
-            return Ok(());
-        }
-        IndexPayloadPointer::ExternalStream { container_ordinal } => {
-            validate_container_ordinal(container_ordinal, stream_containers.len())?;
-            let container = &stream_containers
-                [usize::try_from(container_ordinal).map_err(|_| IndexRunError::IntegerOverflow)?];
-            if container.payload_header.plaintext_len != content_len {
-                return Err(IndexRunError::InvalidStreamContainer);
-            }
-            return Ok(());
-        }
+
         IndexPayloadPointer::ExternalStandaloneStream { container_ordinal } => {
             validate_container_ordinal(container_ordinal, standalone_stream_containers.len())?;
             let container = &standalone_stream_containers
                 [usize::try_from(container_ordinal).map_err(|_| IndexRunError::IntegerOverflow)?];
-            if container.payload_header.plaintext_len != content_len {
+            if container.payload_layout.plaintext_len != content_len {
                 return Err(IndexRunError::InvalidStandaloneStreamContainer);
             }
             return Ok(());
@@ -2880,11 +2738,8 @@ fn derived_record_stored_len(content_len: u64) -> Result<u64, IndexRunError> {
         .ok_or(IndexRunError::InvalidPackRecordRange)
 }
 
-fn validate_repeated_record_facts(
-    mutations: &[IndexMutation],
-    self_pack: Option<&IndexRunSelfPack>,
-    containers: &[IndexRunContainer],
-) -> Result<(), IndexRunError> {
+fn validate_repeated_record_facts(mutations: &[IndexMutation]) -> Result<(), IndexRunError> {
+    // Both callers validate individual pointers before checking cross-record facts.
     let mut facts = BTreeMap::new();
     let mut spans = Vec::new();
     for mutation in mutations {
@@ -2893,9 +2748,7 @@ fn validate_repeated_record_facts(
         };
         let (source, record) = match upsert.payload {
             IndexPayloadPointer::Empty => continue,
-            IndexPayloadPointer::SelfStream
-            | IndexPayloadPointer::ExternalStream { .. }
-            | IndexPayloadPointer::ExternalStandaloneStream { .. } => continue,
+            IndexPayloadPointer::ExternalStandaloneStream { .. } => continue,
             IndexPayloadPointer::SelfPack { record } => (0_u32, record),
             IndexPayloadPointer::ExternalPack {
                 container_ordinal,
@@ -2907,15 +2760,6 @@ fn validate_repeated_record_facts(
                 record,
             ),
         };
-        validate_payload_pointer(
-            upsert.payload,
-            upsert.content_len,
-            self_pack,
-            containers,
-            None,
-            &[],
-            &[],
-        )?;
         let key = (source, record.record_ordinal);
         let value = (record, upsert.content_len);
         match facts.get(&key) {
@@ -2972,11 +2816,7 @@ fn encode_payload_pointer(
             writer.varint(u64::from(container_ordinal))?;
             encode_pack_record_pointer(writer, record)?;
         }
-        IndexPayloadPointer::SelfStream => writer.u8(3)?,
-        IndexPayloadPointer::ExternalStream { container_ordinal } => {
-            writer.u8(4)?;
-            writer.varint(u64::from(container_ordinal))?;
-        }
+
         IndexPayloadPointer::ExternalStandaloneStream { container_ordinal } => {
             writer.u8(5)?;
             writer.varint(u64::from(container_ordinal))?;
@@ -2989,8 +2829,7 @@ fn decode_payload_pointer(
     reader: &mut Reader<'_>,
     containers: &[IndexRunContainer],
     self_pack: Option<&IndexRunSelfPack>,
-    stream_containers: &[IndexRunStreamContainer],
-    self_stream: Option<&IndexRunSelfStream>,
+
     standalone_stream_containers: &[IndexRunStandaloneStreamContainer],
 ) -> Result<IndexPayloadPointer, IndexRunError> {
     match reader.u8()? {
@@ -3017,17 +2856,6 @@ fn decode_payload_pointer(
                 container_ordinal,
                 record,
             })
-        }
-        3 => {
-            if self_stream.is_none() {
-                return Err(IndexRunError::InvalidSelfStream);
-            }
-            Ok(IndexPayloadPointer::SelfStream)
-        }
-        4 => {
-            let container_ordinal = reader.u32_varint()?;
-            validate_container_ordinal(container_ordinal, stream_containers.len())?;
-            Ok(IndexPayloadPointer::ExternalStream { container_ordinal })
         }
         5 => {
             let container_ordinal = reader.u32_varint()?;
@@ -3073,7 +2901,7 @@ fn encode_retention(
                 RetentionMode::Governance => 1,
                 RetentionMode::Compliance => 2,
             })?;
-            writer.u32(retention.retain_days)
+            writer.varint(u64::from(retention.retain_days))
         }
     }
 }
@@ -3093,7 +2921,7 @@ fn decode_retention(reader: &mut Reader<'_>) -> Result<Option<RetentionPolicy>, 
                     });
                 }
             };
-            Ok(Some(RetentionPolicy::new(mode, reader.u32()?)))
+            Ok(Some(RetentionPolicy::new(mode, reader.u32_varint()?)))
         }
         value => Err(IndexRunError::InvalidTag {
             field: "retention option",
@@ -3123,6 +2951,35 @@ fn decode_legal_hold(reader: &mut Reader<'_>) -> Result<Option<LegalHoldStatus>,
             value,
         }),
     }
+}
+
+fn encode_checksum(
+    writer: &mut Writer,
+    checksum: Option<&ObjectChecksum>,
+) -> Result<(), IndexRunError> {
+    let Some(checksum) = checksum else {
+        return writer.u8(0);
+    };
+    let encoded = checksum.encode();
+    validate_count("checksum", encoded.len(), ObjectChecksum::MAX_ENCODED_BYTES)?;
+    writer.u8(u8::try_from(encoded.len()).map_err(|_| IndexRunError::IntegerOverflow)?)?;
+    writer.bytes(&encoded)
+}
+
+fn decode_checksum(reader: &mut Reader<'_>) -> Result<Option<ObjectChecksum>, IndexRunError> {
+    let length = usize::from(reader.u8()?);
+    if length == 0 {
+        return Ok(None);
+    }
+    validate_count("checksum", length, ObjectChecksum::MAX_ENCODED_BYTES)?;
+    ObjectChecksum::decode(reader.bytes(length)?)
+        .map(Some)
+        .map_err(|_| IndexRunError::InvalidValue { field: "checksum" })
+}
+
+fn decode_etag(reader: &mut Reader<'_>) -> Result<ObjectEtag, IndexRunError> {
+    ObjectEtag::decode(reader.bytes(ObjectEtag::ENCODED_BYTES)?)
+        .map_err(|_| IndexRunError::InvalidValue { field: "etag" })
 }
 
 fn decode_blind_key(reader: &mut Reader<'_>) -> Result<IndexBlindKey, IndexRunError> {
@@ -3181,10 +3038,6 @@ impl Writer {
     }
 
     fn u16(&mut self, value: u16) -> Result<(), IndexRunError> {
-        self.bytes(&value.to_be_bytes())
-    }
-
-    fn u32(&mut self, value: u32) -> Result<(), IndexRunError> {
         self.bytes(&value.to_be_bytes())
     }
 
@@ -3257,12 +3110,6 @@ impl<'a> Reader<'a> {
         let mut bytes = [0_u8; 2];
         bytes.copy_from_slice(self.bytes(2)?);
         Ok(u16::from_be_bytes(bytes))
-    }
-
-    fn u32(&mut self) -> Result<u32, IndexRunError> {
-        let mut bytes = [0_u8; 4];
-        bytes.copy_from_slice(self.bytes(4)?);
-        Ok(u32::from_be_bytes(bytes))
     }
 
     fn u64(&mut self) -> Result<u64, IndexRunError> {
@@ -3338,25 +3185,34 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::PayloadHeaderReference;
+    use crate::PayloadLayout;
     use crate::run::{
         INDEX_RUN_PLAINTEXT_DOMAIN, IndexBlindKey, IndexMutation, IndexPackRecordPointer,
         IndexPayloadPointer, IndexRun, IndexRunContainer, IndexRunError, IndexRunFrameRole,
         IndexRunKeyringRef, IndexRunLimits, IndexRunSearchBound, IndexRunSelfPack,
-        IndexRunSelfStream, IndexRunStandaloneStreamContainer, IndexRunStreamContainer,
-        IndexTombstone, IndexUpsert, decode_index_run, decode_index_run_frames, encode_index_run,
-        encode_index_run_frames,
+        IndexRunStandaloneStreamContainer, IndexTombstone, IndexUpsert, decode_index_run,
+        decode_index_run_frames, encode_index_run, encode_index_run_frames,
     };
     use rs3_types::{
-        BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
-        RetentionMode, RetentionPolicy, Sequence,
+        BackendObjectId, BackendVersionId, BlindIndexKey, ChecksumAlgorithm, ChecksumType, KeyId,
+        LegalHoldStatus, LogicalPath, Md5Digest, ObjectChecksum, ObjectEtag, RetentionMode,
+        RetentionPolicy, Sequence,
     };
+
+    fn single_etag(byte: u8) -> ObjectEtag {
+        ObjectEtag::single(Md5Digest::from_bytes([byte; 16]))
+    }
+
+    fn multipart_etag(byte: u8, parts: u32) -> ObjectEtag {
+        ObjectEtag::multipart(Md5Digest::from_bytes([byte; 16]), parts).expect("multipart etag")
+    }
 
     fn fixture() -> IndexRun {
         IndexRun {
+            completion_receipt: None,
             sequence: Sequence::new(9),
             self_pack: None,
-            self_stream: None,
+
             containers: vec![IndexRunContainer {
                 object_id: BackendObjectId::new("objects/pack-a").expect("object id"),
                 version_id: Some(BackendVersionId::new("version-3").expect("version id")),
@@ -3370,10 +3226,11 @@ mod tests {
                 pack_section_offset: 512,
                 pack_section_len: 2_048,
                 pack_id: [0x11; 32],
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
                 content_key_id: KeyId::new("content-1").expect("key id"),
                 pack_record_count: 8,
             }],
-            stream_containers: Vec::new(),
+
             standalone_stream_containers: Vec::new(),
             mutations: vec![
                 IndexMutation::Upsert(IndexUpsert {
@@ -3393,6 +3250,8 @@ mod tests {
                     modified_at_ms: -55,
                     retention: Some(RetentionPolicy::new(RetentionMode::Compliance, 30)),
                     legal_hold: Some(LegalHoldStatus::On),
+                    etag: single_etag(0x55),
+                    checksum: None,
                 }),
                 IndexMutation::Tombstone(IndexTombstone {
                     mutation_ordinal: 1,
@@ -3418,84 +3277,29 @@ mod tests {
         run
     }
 
-    fn stream_header() -> PayloadHeaderReference {
-        PayloadHeaderReference {
+    fn stream_header() -> PayloadLayout {
+        PayloadLayout {
             chunk_size: 64 * 1024,
             plaintext_len: 131_089,
             key_id: KeyId::new("stream-content-1").expect("content key id"),
-            nonce_prefix: [0x91; 16],
-            header_len: 73,
+            carrier_id: [0x91; 32],
+            parts: vec![crate::PayloadPart {
+                part_number: 1,
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+                plaintext_len: 131_089,
+            }],
         }
-    }
-
-    fn stream_container() -> IndexRunStreamContainer {
-        let payload_header = stream_header();
-        let payload_section_len = payload_header.header_len
-            + payload_header.plaintext_len
-            + payload_header
-                .plaintext_len
-                .div_ceil(payload_header.chunk_size)
-                * 16;
-        IndexRunStreamContainer {
-            object_id: BackendObjectId::new("commits/v02/stream-a").expect("object id"),
-            version_id: Some(BackendVersionId::new("version-stream-4").expect("version id")),
-            stored_len: 140_000,
-            commit_body_digest: [0x81; 32],
-            keyring_envelope: IndexRunKeyringRef {
-                object_id: BackendObjectId::new("keyrings/stream-historical")
-                    .expect("keyring object id"),
-                digest: [0x82; 32],
-            },
-            sections_start: 8_192,
-            payload_section_ordinal: 0,
-            payload_section_offset: 0,
-            payload_section_len,
-            payload_section_digest: [0x83; 32],
-            payload_id: BackendObjectId::new("payloads/stream-a").expect("payload id"),
-            payload_header,
-        }
-    }
-
-    fn self_stream_fixture() -> IndexRun {
-        let mut run = fixture();
-        run.containers.clear();
-        run.self_stream = Some(IndexRunSelfStream {
-            payload_section_ordinal: 0,
-            payload_id: BackendObjectId::new("payloads/self-stream").expect("payload id"),
-            payload_header: stream_header(),
-        });
-        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
-            panic!("fixture starts with an upsert");
-        };
-        upsert.payload = IndexPayloadPointer::SelfStream;
-        upsert.content_len = stream_header().plaintext_len;
-        run
-    }
-
-    fn external_stream_fixture() -> IndexRun {
-        let mut run = fixture();
-        run.containers.clear();
-        run.stream_containers.push(stream_container());
-        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
-            panic!("fixture starts with an upsert");
-        };
-        upsert.payload = IndexPayloadPointer::ExternalStream {
-            container_ordinal: 0,
-        };
-        upsert.content_len = stream_header().plaintext_len;
-        run
     }
 
     fn standalone_stream_container(byte: u8) -> IndexRunStandaloneStreamContainer {
-        let payload_header = stream_header();
-        let stored_len = payload_header.header_len
-            + payload_header.plaintext_len
-            + payload_header
+        let payload_layout = stream_header();
+        let stored_len = payload_layout.plaintext_len
+            + payload_layout
                 .plaintext_len
-                .div_ceil(payload_header.chunk_size)
+                .div_ceil(payload_layout.chunk_size)
                 * 16;
         IndexRunStandaloneStreamContainer {
-            object_id: BackendObjectId::new(format!("objects/v02/standalone-{byte}"))
+            object_id: BackendObjectId::new(format!("objects/v03/standalone-{byte}"))
                 .expect("object id"),
             version_id: Some(
                 BackendVersionId::new(format!("version-standalone-{byte}")).expect("version id"),
@@ -3507,7 +3311,7 @@ mod tests {
                     .expect("keyring object id"),
                 digest: [byte.wrapping_add(1); 32],
             },
-            payload_header,
+            payload_layout,
         }
     }
 
@@ -3524,6 +3328,206 @@ mod tests {
         };
         upsert.content_len = stream_header().plaintext_len;
         run
+    }
+
+    fn completion_fixture() -> IndexRun {
+        let mut run = standalone_stream_fixture();
+        run.mutations.truncate(1);
+        let checksum = ObjectChecksum::new(
+            ChecksumAlgorithm::Crc32c,
+            ChecksumType::Composite { parts: 1 },
+            vec![0xa4; 4],
+        )
+        .expect("checksum");
+        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
+            panic!("upsert");
+        };
+        upsert.checksum = Some(checksum.clone());
+        upsert.etag = multipart_etag(0x56, 1);
+        run.completion_receipt = Some(crate::completion::CompletionReceipt {
+            upload_id: rs3_types::MultipartUploadId::from_bytes([0x71; 32]),
+            commit_sequence: Sequence::new(12),
+            selection_digest: [0x72; 32],
+            attempts_digest: [0x73; 32],
+            key: upsert.path.clone(),
+            content_len: upsert.content_len,
+            etag: upsert.etag,
+            checksum: Some(checksum),
+        });
+        run
+    }
+
+    #[test]
+    fn completion_receipt_binds_the_only_upsert() {
+        let limits = IndexRunLimits::default();
+        let run = completion_fixture();
+        let bytes = encode_index_run(&run, &limits).expect("encode receipt run");
+        assert_eq!(decode_index_run(&bytes, &limits), Ok(run.clone()));
+        for field in 0..4 {
+            let mut wrong = run.clone();
+            let receipt = wrong.completion_receipt.as_mut().expect("receipt");
+            match field {
+                0 => receipt.key = LogicalPath::new("different/key").expect("path"),
+                1 => receipt.content_len += 1,
+                2 => receipt.etag = multipart_etag(0x57, 1),
+                _ => wrong.mutations.push(fixture().mutations[1].clone()),
+            }
+            assert!(encode_index_run(&wrong, &limits).is_err());
+        }
+        // Receipt-only metadata cannot authorize a publication without a value.
+        let mut missing = run;
+        missing.mutations.clear();
+        assert!(encode_index_run(&missing, &limits).is_err());
+    }
+
+    #[test]
+    fn completion_receipt_checksum_must_match_bound_upsert() {
+        let limits = IndexRunLimits::default();
+        let checksum = ObjectChecksum::new(
+            ChecksumAlgorithm::Crc32c,
+            ChecksumType::Composite { parts: 1 },
+            vec![0xa1; 4],
+        )
+        .expect("checksum");
+        let mut run = completion_fixture();
+        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
+            panic!("upsert");
+        };
+        upsert.checksum = Some(checksum.clone());
+        run.completion_receipt.as_mut().expect("receipt").checksum = Some(checksum);
+        assert!(encode_index_run(&run, &limits).is_ok());
+
+        let mut receipt_mismatch = run.clone();
+        receipt_mismatch
+            .completion_receipt
+            .as_mut()
+            .expect("receipt")
+            .checksum = None;
+        assert!(encode_index_run(&receipt_mismatch, &limits).is_err());
+
+        let mut upsert_mismatch = run;
+        let IndexMutation::Upsert(upsert) = &mut upsert_mismatch.mutations[0] else {
+            panic!("upsert");
+        };
+        upsert.checksum = None;
+        assert!(encode_index_run(&upsert_mismatch, &limits).is_err());
+    }
+
+    #[test]
+    fn checksum_namespace_codec_round_trips_and_rejects_malformed_bytes() {
+        let checksum = ObjectChecksum::new(
+            ChecksumAlgorithm::Sha256,
+            ChecksumType::FullObject,
+            vec![0xb2; 32],
+        )
+        .expect("checksum");
+        let mut encoded = super::Writer::new(64);
+        super::encode_checksum(&mut encoded, Some(&checksum)).expect("encode checksum");
+        let encoded = encoded.finish();
+        assert_eq!(
+            super::decode_checksum(&mut super::Reader::new(&encoded)),
+            Ok(Some(checksum))
+        );
+        assert_eq!(
+            super::decode_checksum(&mut super::Reader::new(&[0])),
+            Ok(None)
+        );
+        assert!(super::decode_checksum(&mut super::Reader::new(&[49])).is_err());
+        assert!(super::decode_checksum(&mut super::Reader::new(&[1, 0])).is_err());
+    }
+
+    #[test]
+    fn completion_receipt_allows_only_stale_namespace_tombstones() {
+        let limits = IndexRunLimits::default();
+        let mut run = completion_fixture();
+        let IndexMutation::Upsert(upsert) = &run.mutations[0] else {
+            panic!("upsert");
+        };
+        run.mutations.push(IndexMutation::Tombstone(IndexTombstone {
+            mutation_ordinal: 1,
+            blind_key: IndexBlindKey::from_bytes([0x44; 32]),
+            namespace_key_id: KeyId::new("namespace-old").expect("key id"),
+            path: upsert.path.clone(),
+            generation: upsert.generation,
+        }));
+        let bytes = encode_index_run(&run, &limits).expect("encode rotated namespace");
+        assert_eq!(decode_index_run(&bytes, &limits), Ok(run.clone()));
+        for field in 0..6 {
+            let mut wrong = run.clone();
+            let IndexMutation::Upsert(upsert) = &run.mutations[0] else {
+                panic!("upsert");
+            };
+            let IndexMutation::Tombstone(tombstone) = &mut wrong.mutations[1] else {
+                panic!("tombstone");
+            };
+            match field {
+                0 => tombstone.path = LogicalPath::new("unrelated/key").expect("path"),
+                1 => tombstone.generation = Sequence::new(99),
+                2 => tombstone.namespace_key_id = upsert.namespace_key_id.clone(),
+                3 => tombstone.blind_key = upsert.blind_key,
+                4 => {
+                    let mut duplicate = tombstone.clone();
+                    duplicate.mutation_ordinal = 2;
+                    wrong.mutations.push(IndexMutation::Tombstone(duplicate));
+                }
+                _ => {
+                    let mut duplicate = upsert.clone();
+                    duplicate.mutation_ordinal = 2;
+                    wrong.mutations.push(IndexMutation::Upsert(duplicate));
+                }
+            }
+            assert!(encode_index_run(&wrong, &limits).is_err(), "field {field}");
+        }
+    }
+
+    #[test]
+    fn frozen_container_tables_preserve_canonical_wire_bytes() {
+        for (run, expected) in [
+            (
+                fixture(),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_index_run/external-pack.bin"
+                ))
+                .as_slice(),
+            ),
+            (
+                standalone_stream_fixture(),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_index_run/standalone.bin"
+                ))
+                .as_slice(),
+            ),
+            (
+                completion_fixture(),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../test-vectors/v03/v03_index_run/completion.bin"
+                ))
+                .as_slice(),
+            ),
+        ] {
+            let limits = IndexRunLimits::default();
+            assert_eq!(encode_index_run(&run, &limits).expect("encode"), expected);
+            assert_eq!(decode_index_run(expected, &limits).expect("decode"), run);
+            for length in 0..expected.len() {
+                assert!(decode_index_run(&expected[..length], &limits).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn retired_commit_stream_pointer_tags_fail_closed() {
+        for tag in [3, 4] {
+            assert_eq!(
+                super::decode_payload_pointer(&mut super::Reader::new(&[tag]), &[], None, &[]),
+                Err(IndexRunError::InvalidTag {
+                    field: "payload pointer",
+                    value: tag
+                })
+            );
+        }
     }
 
     #[test]
@@ -3623,7 +3627,7 @@ mod tests {
         };
         let encoded = encode_index_run_frames(&fixture(), &limits).expect("encode key table");
         let mut excessive_count = frame_bytes(encoded);
-        let table_count_offset = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 4 + 8 + 3 + 1;
+        let table_count_offset = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 1 + 8 + 3 + 1;
         excessive_count[0][table_count_offset] = 3;
         assert_eq!(
             decode_index_run_frames(&excessive_count, &limits),
@@ -3651,13 +3655,10 @@ mod tests {
     }
 
     #[test]
-    fn self_and_external_streams_round_trip_canonically() {
+    fn standalone_stream_round_trips_canonically() {
         let limits = IndexRunLimits::default();
-        for run in [
-            self_stream_fixture(),
-            external_stream_fixture(),
-            standalone_stream_fixture(),
-        ] {
+        {
+            let run = standalone_stream_fixture();
             let encoded = encode_index_run(&run, &limits).expect("encode stream run");
             assert_eq!(
                 decode_index_run(&encoded, &limits),
@@ -3693,37 +3694,95 @@ mod tests {
     }
 
     #[test]
-    fn zero_plaintext_standalone_stream_keeps_its_authenticated_object() {
+    fn maximum_selected_part_table_round_trips_without_raising_ordinary_record_limit() {
         let limits = IndexRunLimits::default();
         let mut run = standalone_stream_fixture();
         let container = &mut run.standalone_stream_containers[0];
-        container.payload_header.plaintext_len = 0;
-        container.stored_len = container.payload_header.header_len;
+        container.payload_layout.parts = (1..=crate::MAX_PAYLOAD_PARTS as u32)
+            .map(|part_number| crate::PayloadPart {
+                part_number,
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x63; 32]),
+                plaintext_len: 1,
+            })
+            .collect();
+        container.payload_layout.plaintext_len = crate::MAX_PAYLOAD_PARTS as u64;
+        container.stored_len = container
+            .payload_layout
+            .stored_len()
+            .expect("bounded part table");
+        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
+            panic!("upsert");
+        };
+        upsert.content_len = crate::MAX_PAYLOAD_PARTS as u64;
+        let encoded = encode_index_run_frames(&run, &limits).expect("large part table");
+        assert!(
+            encoded
+                .frames
+                .iter()
+                .any(|frame| frame.bytes.len() > limits.max_record_bytes)
+        );
+        assert!(
+            encoded
+                .frames
+                .iter()
+                .all(|frame| frame.bytes.len() <= limits.max_frame_bytes)
+        );
+        let bytes = encode_index_run(&run, &limits).expect("bundle");
+        assert_eq!(decode_index_run(&bytes, &limits), Ok(run.clone()));
+        assert_eq!(
+            super::record_limit(super::IndexRunFrameRole::Metadata, Some(0), &limits),
+            limits.max_record_bytes
+        );
+        assert_eq!(
+            super::record_limit(super::IndexRunFrameRole::Namespace, Some(2), &limits),
+            limits.max_record_bytes
+        );
+        run.standalone_stream_containers[0]
+            .payload_layout
+            .parts
+            .push(crate::PayloadPart {
+                part_number: 10_001,
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x64; 32]),
+                plaintext_len: 1,
+            });
+        assert!(encode_index_run(&run, &limits).is_err());
+    }
+
+    #[test]
+    fn zero_plaintext_standalone_stream_is_rejected() {
+        let limits = IndexRunLimits::default();
+        let mut run = standalone_stream_fixture();
+        let container = &mut run.standalone_stream_containers[0];
+        container.payload_layout.plaintext_len = 0;
+        container.stored_len = 0;
         let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
             panic!("fixture starts with an upsert");
         };
         upsert.content_len = 0;
 
-        let encoded = encode_index_run(&run, &limits).expect("encode zero standalone stream");
-        assert_eq!(decode_index_run(&encoded, &limits), Ok(run));
+        assert_eq!(
+            encode_index_run(&run, &limits),
+            Err(IndexRunError::InvalidStandaloneStreamContainer)
+        );
     }
 
     #[test]
-    fn container_limit_counts_standalone_and_commit_streams_together() {
+    fn container_limit_counts_all_standalone_objects() {
         let mut limits = IndexRunLimits {
             max_containers: 1,
             ..IndexRunLimits::default()
         };
         let mut run = standalone_stream_fixture();
-        run.stream_containers.push(stream_container());
+        run.standalone_stream_containers
+            .push(standalone_stream_container(0x95));
         let IndexMutation::Upsert(mut peer) = run.mutations[0].clone() else {
             panic!("fixture starts with an upsert");
         };
         peer.mutation_ordinal = 2;
         peer.blind_key = IndexBlindKey::from_bytes([0x97; 32]);
         peer.path = LogicalPath::new("tenant/commit-stream-limit-peer").expect("path");
-        peer.payload = IndexPayloadPointer::ExternalStream {
-            container_ordinal: 0,
+        peer.payload = IndexPayloadPointer::ExternalStandaloneStream {
+            container_ordinal: 1,
         };
         run.mutations.push(IndexMutation::Upsert(peer));
 
@@ -3741,7 +3800,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_stream_rejects_invalid_pointer_and_cross_table_alias() {
+    fn standalone_stream_rejects_invalid_pointer() {
         let limits = IndexRunLimits::default();
         let mut run = standalone_stream_fixture();
         let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
@@ -3754,30 +3813,10 @@ mod tests {
             encode_index_run_frames(&run, &limits),
             Err(IndexRunError::InvalidContainerOrdinal(1))
         );
-
-        run = standalone_stream_fixture();
-        let mut commit_stream = stream_container();
-        commit_stream.object_id = run.standalone_stream_containers[0].object_id.clone();
-        commit_stream.version_id = run.standalone_stream_containers[0].version_id.clone();
-        run.stream_containers.push(commit_stream);
-        let IndexMutation::Upsert(mut peer) = run.mutations[0].clone() else {
-            panic!("fixture starts with an upsert");
-        };
-        peer.mutation_ordinal = 2;
-        peer.blind_key = IndexBlindKey::from_bytes([0x96; 32]);
-        peer.path = LogicalPath::new("tenant/commit-stream-peer").expect("path");
-        peer.payload = IndexPayloadPointer::ExternalStream {
-            container_ordinal: 0,
-        };
-        run.mutations.push(IndexMutation::Upsert(peer));
-        assert_eq!(
-            encode_index_run_frames(&run, &limits),
-            Err(IndexRunError::DuplicateContainer)
-        );
     }
 
     #[test]
-    fn decoder_rejects_pre_v6_frames() {
+    fn decoder_rejects_pre_v10_frames() {
         let limits = IndexRunLimits::default();
         let mut encoded = encode_index_run(&standalone_stream_fixture(), &limits)
             .expect("encode standalone stream run");
@@ -3786,36 +3825,18 @@ mod tests {
             .position(|window| window == INDEX_RUN_PLAINTEXT_DOMAIN)
             .expect("frame domain");
         let version_offset = domain_offset + INDEX_RUN_PLAINTEXT_DOMAIN.len();
-        encoded[version_offset..version_offset + 2].copy_from_slice(&5_u16.to_be_bytes());
+        encoded[version_offset..version_offset + 2].copy_from_slice(&9_u16.to_be_bytes());
 
         assert_eq!(
             decode_index_run(&encoded, &limits),
-            Err(IndexRunError::UnsupportedVersion(5))
+            Err(IndexRunError::UnsupportedVersion(9))
         );
     }
 
     #[test]
-    fn zero_plaintext_stream_keeps_its_authenticated_carrier() {
+    fn one_standalone_stream_can_back_multiple_namespace_mutations() {
         let limits = IndexRunLimits::default();
-        let mut run = self_stream_fixture();
-        run.self_stream
-            .as_mut()
-            .expect("self stream")
-            .payload_header
-            .plaintext_len = 0;
-        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
-            panic!("fixture starts with an upsert");
-        };
-        upsert.content_len = 0;
-
-        let encoded = encode_index_run(&run, &limits).expect("encode zero plaintext stream");
-        assert_eq!(decode_index_run(&encoded, &limits), Ok(run));
-    }
-
-    #[test]
-    fn one_self_stream_can_back_multiple_namespace_mutations() {
-        let limits = IndexRunLimits::default();
-        let mut run = self_stream_fixture();
+        let mut run = standalone_stream_fixture();
         let IndexMutation::Upsert(mut rotated) = run.mutations[0].clone() else {
             panic!("fixture starts with an upsert");
         };
@@ -3829,69 +3850,10 @@ mod tests {
     }
 
     #[test]
-    fn streamed_payloads_require_exact_matching_declarations() {
-        let limits = IndexRunLimits::default();
-        let mut run = self_stream_fixture();
-        run.self_pack = Some(IndexRunSelfPack {
-            pack_id: [0x71; 32],
-            content_key_id: KeyId::new("pack-content").expect("content key id"),
-            stored_len: 256,
-            record_count: 1,
-        });
-        assert_eq!(
-            encode_index_run_frames(&run, &limits),
-            Err(IndexRunError::InvalidSelfStream)
-        );
-
-        run = self_stream_fixture();
-        let IndexMutation::Upsert(upsert) = &mut run.mutations[0] else {
-            panic!("fixture starts with an upsert");
-        };
-        upsert.content_len += 1;
-        assert_eq!(
-            encode_index_run_frames(&run, &limits),
-            Err(IndexRunError::InvalidSelfStream)
-        );
-
-        run = external_stream_fixture();
-        run.stream_containers[0].payload_header.plaintext_len += 1;
-        assert_eq!(
-            encode_index_run_frames(&run, &limits),
-            Err(IndexRunError::InvalidStreamContainer)
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_or_unused_stream_containers() {
-        let limits = IndexRunLimits::default();
-        let mut run = external_stream_fixture();
-        run.stream_containers[0].payload_section_len -= 1;
-        assert_eq!(
-            encode_index_run_frames(&run, &limits),
-            Err(IndexRunError::InvalidStreamContainer)
-        );
-
-        run = external_stream_fixture();
-        let mut unused = run.stream_containers[0].clone();
-        unused.object_id = BackendObjectId::new("commits/v02/stream-b").expect("object id");
-        run.stream_containers.push(unused);
-        assert_eq!(
-            encode_index_run_frames(&run, &limits),
-            Err(IndexRunError::UnusedStreamContainer(1))
-        );
-
-        run.stream_containers.swap(0, 1);
-        assert_eq!(
-            encode_index_run_frames(&run, &limits),
-            Err(IndexRunError::InvalidContainerOrder)
-        );
-    }
-
-    #[test]
     fn rejects_tampered_stream_container_ranges_during_decode() {
         let limits = IndexRunLimits::default();
-        let run = external_stream_fixture();
-        let expected_len = run.stream_containers[0].payload_section_len.to_be_bytes();
+        let run = standalone_stream_fixture();
+        let expected_len = run.standalone_stream_containers[0].stored_len.to_be_bytes();
         let mut encoded = encode_index_run(&run, &limits).expect("encode stream run");
         let offset = encoded
             .windows(expected_len.len())
@@ -3901,19 +3863,19 @@ mod tests {
 
         assert_eq!(
             decode_index_run(&encoded, &limits),
-            Err(IndexRunError::InvalidStreamContainer)
+            Err(IndexRunError::InvalidStandaloneStreamContainer)
         );
     }
 
     #[test]
     fn rejects_one_exact_object_in_both_container_tables() {
         let limits = IndexRunLimits::default();
-        let mut run = external_stream_fixture();
-        run.stream_containers[0].object_id = run.containers.first().map_or_else(
+        let mut run = standalone_stream_fixture();
+        run.standalone_stream_containers[0].object_id = run.containers.first().map_or_else(
             || BackendObjectId::new("objects/pack-a").expect("pack object id"),
             |container| container.object_id.clone(),
         );
-        run.stream_containers[0].version_id =
+        run.standalone_stream_containers[0].version_id =
             Some(BackendVersionId::new("version-3").expect("matching pack version id"));
         run.containers = fixture().containers;
         let IndexMutation::Upsert(mut pack_upsert) = run.mutations[0].clone() else {
@@ -4000,11 +3962,159 @@ mod tests {
     }
 
     #[test]
+    fn listing_prefixes_reset_at_frame_boundaries_and_preserve_duplicate_paths() {
+        let limits = IndexRunLimits {
+            max_frame_bytes: 300,
+            ..IndexRunLimits::default()
+        };
+        let mut run = multi_frame_fixture();
+        // These UTF-8 paths share a byte inside a multi-byte character. Pairs
+        // repeat the exact path at distinct ordinals, requiring an empty suffix.
+        for (index, mutation) in run.mutations.iter_mut().enumerate() {
+            if let IndexMutation::Upsert(upsert) = mutation {
+                upsert.path = LogicalPath::new(format!(
+                    "tenant/{}",
+                    if index / 2 % 2 == 0 { "é" } else { "ê" }
+                ))
+                .expect("UTF-8 path");
+            }
+        }
+        let encoded = encode_index_run_frames(&run, &limits).expect("front-coded frames");
+        let listing: Vec<_> = encoded
+            .frames
+            .iter()
+            .filter(|frame| frame.role == IndexRunFrameRole::Listing)
+            .collect();
+        assert!(listing.len() > 1, "exercise frame reset");
+        for frame in listing {
+            assert!(frame.bytes.len() <= limits.max_frame_bytes);
+            let (header, mut reader) =
+                super::decode_frame_header(&frame.bytes, &limits).expect("frame header");
+            let mut previous = None::<LogicalPath>;
+            for index in 0..header.frame_record_count {
+                let mut record = reader.record(limits.max_record_bytes).expect("record");
+                if index == 0 {
+                    assert_eq!(record.remaining[0], 0, "first path is independent");
+                }
+                let path = super::decode_listing_path(
+                    &mut record,
+                    previous
+                        .as_ref()
+                        .map_or(&[], |path| path.as_str().as_bytes()),
+                    &limits,
+                )
+                .expect("independent path decode");
+                previous = Some(path);
+            }
+        }
+        assert_eq!(
+            decode_index_run_frames(&frame_bytes(encoded), &limits),
+            Ok(run)
+        );
+    }
+
+    #[test]
+    fn listing_path_decoder_rejects_noncanonical_and_oversized_prefixes() {
+        let limits = IndexRunLimits {
+            max_path_bytes: 8,
+            ..IndexRunLimits::default()
+        };
+        let decode = |bytes: &[u8], previous: &[u8]| {
+            super::decode_listing_path(&mut super::Reader::new(bytes), previous, &limits)
+        };
+        assert_eq!(
+            decode(&[1, 1, b'x'], b""),
+            Err(IndexRunError::InvalidPathPrefix)
+        );
+        assert_eq!(
+            decode(&[4, 1, b'x'], b"abc"),
+            Err(IndexRunError::InvalidPathPrefix)
+        );
+        assert_eq!(
+            decode(&[1, 2, b'b', b'x'], b"abc"),
+            Err(IndexRunError::InvalidPathPrefix)
+        );
+        assert_eq!(
+            decode(&[0x80, 0, 1, b'x'], b""),
+            Err(IndexRunError::NonCanonicalVarint)
+        );
+        assert_eq!(
+            decode(&[0, 0x81, 0, b'x'], b""),
+            Err(IndexRunError::NonCanonicalVarint)
+        );
+        assert_eq!(
+            decode(&[0, 1, 0xff], b""),
+            Err(IndexRunError::InvalidUtf8 {
+                field: "logical path"
+            })
+        );
+        assert_eq!(
+            decode(&[0, 0], b""),
+            Err(IndexRunError::InvalidValue {
+                field: "logical path"
+            })
+        );
+        assert!(matches!(
+            decode(&[8, 1, b'x'], b"12345678"),
+            Err(IndexRunError::LimitExceeded {
+                field: "logical path",
+                actual: 9,
+                maximum: 8
+            })
+        ));
+        assert_eq!(
+            decode(&[0, 2, b'x'], b""),
+            Err(IndexRunError::UnexpectedEof)
+        );
+        // Sharing only the leading byte of a UTF-8 code point is canonical.
+        assert_eq!(
+            decode(&[1, 1, 0xaa], "é".as_bytes()),
+            LogicalPath::new("ê").map_err(|_| IndexRunError::InvalidPathPrefix)
+        );
+    }
+
+    #[test]
+    fn front_coding_reduces_repeated_path_bytes_without_changing_search_bounds() {
+        let mut run = multi_frame_fixture();
+        for mutation in &mut run.mutations {
+            if let IndexMutation::Upsert(upsert) = mutation {
+                upsert.path = LogicalPath::new(format!(
+                    "{}/object-{:04}",
+                    "shared/".repeat(100),
+                    upsert.mutation_ordinal
+                ))
+                .expect("long path");
+            }
+        }
+        let full_path_bytes: usize = run
+            .mutations
+            .iter()
+            .map(|mutation| super::mutation_path(mutation).as_str().len())
+            .sum();
+        let limits = IndexRunLimits::default();
+        let encoded = encode_index_run_frames(&run, &limits).expect("compressed listing");
+        let listing_bytes: usize = encoded
+            .frames
+            .iter()
+            .filter(|frame| frame.role == IndexRunFrameRole::Listing)
+            .map(|frame| frame.bytes.len())
+            .sum();
+        assert!(
+            listing_bytes < full_path_bytes / 4,
+            "shared prefix must not repeat per record"
+        );
+        assert_eq!(
+            decode_index_run_frames(&frame_bytes(encoded), &limits),
+            Ok(run)
+        );
+    }
+
+    #[test]
     fn rejects_noncanonical_varint() {
         let limits = IndexRunLimits::default();
         let mut frames =
             frame_bytes(encode_index_run_frames(&fixture(), &limits).expect("encode framed run"));
-        let mutation_count_offset = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 4 + 8;
+        let mutation_count_offset = INDEX_RUN_PLAINTEXT_DOMAIN.len() + 2 + 1 + 1 + 8;
         frames[0].splice(mutation_count_offset..=mutation_count_offset, [0x82, 0x00]);
 
         assert_eq!(
@@ -4118,7 +4228,7 @@ mod tests {
         let encoded = encode_index_run(&fixture(), &IndexRunLimits::default()).expect("encode run");
         assert_eq!(
             hex(&encoded),
-            "03fb017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006000000000000000000000000090202020001b601000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c23232323232323232323232323232323232323232323232323232323232323230000000300000000000002000000000000000800111111111111111111111111111111111111111111111111111111111111111109636f6e74656e742d31080d030b6e616d6573706163652d3192017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006010000000000000000000000090202023900003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901020000001e02240101444444444444444444444444444444444444444444444444444444444444444400126a7273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a0006020000000000000000000000090202021201010e74656e616e742f64656c65746564122300001574656e616e742f736e617073686f742f6368756e6b11d209ffffffffffffffc9"
+            "0395027273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a000a000000000000000000090202020001d301000e6f626a656374732f7061636b2d61010976657273696f6e2d3300000000000010002222222222222222222222222222222222222222222222222222222222222222136b657972696e67732f686973746f726963616c232323232323232323232323232323232323232323232323232323232323232303000000000000020000000000000008001111111111111111111111111111111111111111111111111111111111111111a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a309636f6e74656e742d31080d030b6e616d6573706163652d31a1017273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a000a010000000000000000090202024b00003333333333333333333333333333333333333333333333333333333333333333001102000764d209ffffffffffffffc901021e0200000000005555555555555555555555555555555524010144444444444444444444444444444444444444444444444444444444444444440012627273333a696e6465782d72756e2d6672616d652d706c61696e746578743a76320a000a0200000000000000000902020213000e74656e616e742f64656c657465640101121d070e736e617073686f742f6368756e6b000011d209ffffffffffffffc9"
         );
     }
 
@@ -4138,6 +4248,103 @@ mod tests {
         assert!(!debug.contains("tenant/snapshot/chunk"));
         assert!(!debug.contains("tenant/deleted"));
         assert!(!debug.contains("plaintext: ["));
+    }
+
+    fn multi_frame_fixture() -> IndexRun {
+        let mut run = fixture();
+        let container = run.containers.remove(0);
+        let IndexMutation::Upsert(upsert) = run.mutations.remove(0) else {
+            panic!("fixture starts with an upsert");
+        };
+        run.mutations.clear();
+        for ordinal in 0_u8..24 {
+            let mut container = container.clone();
+            container.object_id = BackendObjectId::new(format!("objects/pack-{ordinal:02}"))
+                .expect("container object id");
+            run.containers.push(container);
+            let mut upsert = upsert.clone();
+            upsert.mutation_ordinal = u32::from(ordinal);
+            upsert.blind_key = IndexBlindKey::from_bytes([ordinal; 32]);
+            upsert.path = LogicalPath::new(format!("tenant/object-{ordinal:02}")).expect("path");
+            if let IndexPayloadPointer::ExternalPack {
+                container_ordinal, ..
+            } = &mut upsert.payload
+            {
+                *container_ordinal = u32::from(ordinal);
+            }
+            run.mutations.push(IndexMutation::Upsert(upsert));
+        }
+        run
+    }
+
+    #[test]
+    fn rejects_missing_repeated_or_reordered_frames_across_all_roles() {
+        let limits = IndexRunLimits {
+            max_frame_bytes: 300,
+            ..IndexRunLimits::default()
+        };
+        let run = multi_frame_fixture();
+        let encoded = encode_index_run_frames(&run, &limits).expect("multi-frame run");
+        for role in [
+            IndexRunFrameRole::Metadata,
+            IndexRunFrameRole::Namespace,
+            IndexRunFrameRole::Listing,
+        ] {
+            assert!(
+                encoded
+                    .frames
+                    .iter()
+                    .filter(|frame| frame.role == role)
+                    .count()
+                    > 1
+            );
+        }
+        let frames = frame_bytes(encoded);
+        assert_eq!(decode_index_run_frames(&frames, &limits), Ok(run));
+        for index in 0..frames.len() {
+            let mut missing = frames.clone();
+            missing.remove(index);
+            assert!(
+                decode_index_run_frames(&missing, &limits).is_err(),
+                "missing frame {index}"
+            );
+            let mut repeated = frames.clone();
+            repeated.insert(index, frames[index].clone());
+            assert!(
+                decode_index_run_frames(&repeated, &limits).is_err(),
+                "repeated frame {index}"
+            );
+            if index + 1 < frames.len() {
+                let mut reordered = frames.clone();
+                reordered.swap(index, index + 1);
+                assert!(
+                    decode_index_run_frames(&reordered, &limits).is_err(),
+                    "reordered frame {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn container_order_is_enforced_between_metadata_frames() {
+        let limits = IndexRunLimits {
+            max_frame_bytes: 300,
+            ..IndexRunLimits::default()
+        };
+        let frames =
+            frame_bytes(encode_index_run_frames(&multi_frame_fixture(), &limits).expect("encode"));
+        let mut duplicate = frames.clone();
+        replace_frame_bytes(&mut duplicate, b"objects/pack-01", b"objects/pack-00");
+        assert_eq!(
+            decode_index_run_frames(&duplicate, &limits),
+            Err(IndexRunError::DuplicateContainer)
+        );
+        let mut reversed = frames;
+        replace_frame_bytes(&mut reversed, b"objects/pack-00", b"objects/pack-99");
+        assert_eq!(
+            decode_index_run_frames(&reversed, &limits),
+            Err(IndexRunError::InvalidContainerOrder)
+        );
     }
 
     #[test]
@@ -4201,7 +4408,7 @@ mod tests {
         );
 
         let mut duplicate = frame_bytes(encoded);
-        let upsert_prefix = [0_u8, 0_u8, 21_u8];
+        let upsert_prefix = [0_u8, 0_u8, 0x11_u8, 0xd2, 0x09];
         let ordinal_offset = duplicate[listing_index]
             .windows(upsert_prefix.len())
             .position(|window| window == upsert_prefix)
@@ -4272,6 +4479,7 @@ mod tests {
         );
         run.self_pack = Some(IndexRunSelfPack {
             pack_id: [0x88; 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
             content_key_id: KeyId::new("historical-content").expect("key id"),
             stored_len: 2_048,
             record_count: 3,
@@ -4347,7 +4555,7 @@ mod tests {
     #[test]
     fn rejects_transplanted_self_pack_facts_between_metadata_frames() {
         let limits = IndexRunLimits {
-            max_frame_bytes: 320,
+            max_frame_bytes: 384,
             ..IndexRunLimits::default()
         };
         let mut run = fixture();
@@ -4386,6 +4594,7 @@ mod tests {
         };
         run.self_pack = Some(IndexRunSelfPack {
             pack_id: [0x88; 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
             content_key_id: KeyId::new("historical-content").expect("key id"),
             stored_len: 1_250,
             record_count: 1,
@@ -4444,6 +4653,7 @@ mod tests {
         };
         run.self_pack = Some(IndexRunSelfPack {
             pack_id: [0x88; 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
             content_key_id: KeyId::new("historical-content").expect("key id"),
             stored_len: super::INDEX_PACK_MAX_STORED_BYTES + 1,
             record_count: 1,

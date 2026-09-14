@@ -16,13 +16,13 @@ test-util = []
 [dependencies]
 aes-gcm-siv.workspace = true
 chacha20poly1305.workspace = true
+crc-fast.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true
+md-5.workspace = true
 ring.workspace = true
 rs3-types.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true

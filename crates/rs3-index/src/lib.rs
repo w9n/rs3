@@ -1,31 +1,17 @@
-//! Append-friendly index and checkpoint model.
+//! Append-friendly namespace and authenticated index-run model.
+
+pub mod completion;
 
 pub mod run;
 
 use rs3_types::{
-    BackendObjectId, BackendObjectRef, BackendVersionId, BlindIndexKey, CheckpointId,
-    KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LegalHoldStatus, LogicalPath, ManifestId,
-    PrefixToken, RetentionPolicy, Sequence,
+    BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LegalHoldStatus, LogicalPath,
+    ManifestId, ObjectEtag, PrefixToken, RetentionPolicy, Sequence,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
-
-/// Domain separator prepended to canonical checkpoint payload bytes.
-pub const CHECKPOINT_RECORD_DOMAIN: &[u8] = b"rs3:checkpoint-record:v1\n";
-
-/// Domain separator prepended to durable checkpoint objects.
-pub const CHECKPOINT_OBJECT_DOMAIN: &[u8] = b"rs3:checkpoint-object:v1\n";
-
-/// Domain separator prepended to durable checkpoint evidence objects.
-pub const CHECKPOINT_EVIDENCE_DOMAIN: &[u8] = b"rs3:checkpoint-evidence:v1\n";
-
-/// Domain separator prepended to durable index delta objects.
-pub const INDEX_DELTA_OBJECT_DOMAIN: &[u8] = b"rs3:index-delta-object:v1\n";
-
-/// Domain separator prepended to plaintext index delta payloads before sealing.
-pub const INDEX_DELTA_PLAINTEXT_DOMAIN: &[u8] = b"rs3:index-delta-plaintext:v1\n";
 
 /// Domain separator prepended to plaintext manifest payloads before sealing.
 pub const MANIFEST_PLAINTEXT_DOMAIN: &[u8] = b"rs3:manifest-plaintext:v1\n";
@@ -52,11 +38,14 @@ pub struct ObjectPointer {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PayloadReference {
     /// Compact payload-pack record in the current commit carrying this index run.
-    V2PackSelf {
+    #[serde(rename = "V2PackSelf")]
+    V3PackSelf {
         /// Commit section ordinal containing the payload pack.
         pack_section_ordinal: u32,
         /// Random pack identity bound into every record AEAD operation.
         pack_id: [u8; 32],
+        /// Fresh encryption attempt for this immutable pack.
+        attempt_id: rs3_types::PayloadAttemptId,
         /// Historical content-encryption key needed to open the record.
         content_key_id: KeyId,
         /// Current commit's encrypted-keyring envelope object bound into payload AEAD context.
@@ -71,46 +60,29 @@ pub enum PayloadReference {
         record_offset: u32,
     },
     /// Compact payload-pack record in an accepted exact commit object.
-    V2Pack {
+    #[serde(rename = "V2Pack")]
+    V3Pack {
         /// Exact carrier facts shared by every record in the same payload pack.
         #[serde(flatten)]
-        carrier: Arc<V2PackCarrierReference>,
+        carrier: Arc<V3PackCarrierReference>,
         /// Record-specific facts inside the shared payload pack.
         #[serde(flatten)]
-        record: V2PackRecordReference,
+        record: V3PackRecordReference,
     },
-    /// Payload bytes are in the current commit that carries this index delta.
-    V2Self {
-        /// Opaque payload identity used as the AEAD associated-data object id.
-        payload_id: BackendObjectId,
-        /// Parsed segmented-payload header needed for direct range reads.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        payload_header: Option<PayloadHeaderReference>,
-        /// Absolute byte offset where the containing commit's section region starts.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sections_start: Option<u64>,
-        /// Byte offset relative to the commit section region.
-        offset: u64,
-        /// Encrypted payload-section byte length.
-        length: u64,
-    },
-    /// Payload bytes are in a resolved v2 commit object.
-    V2CommitStream {
-        /// Exact carrier facts shared by every reference to this streamed payload.
-        #[serde(flatten)]
-        carrier: Arc<V2CommitStreamCarrierReference>,
-    },
+    /// Staged value awaiting an authenticated carrier reference; never persisted.
+    Pending,
     /// Streamed payload bytes stored in one exact standalone object.
-    V2StandaloneStream {
+    #[serde(rename = "V2StandaloneStream")]
+    V3StandaloneStream {
         /// Exact carrier facts shared by every reference to this streamed payload.
         #[serde(flatten)]
-        carrier: Arc<V2StandaloneStreamCarrierReference>,
+        carrier: Arc<V3StandaloneStreamCarrierReference>,
     },
 }
 
 /// Exact accepted commit and section facts shared by records in one payload pack.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct V2PackCarrierReference {
+pub struct V3PackCarrierReference {
     /// Commit object key containing the payload-pack section.
     pub commit_key: BackendObjectId,
     /// Provider version identifier for exact-version reads, when available.
@@ -128,6 +100,8 @@ pub struct V2PackCarrierReference {
     pub length: u64,
     /// Random pack identity bound into every record AEAD operation.
     pub pack_id: [u8; 32],
+    /// Fresh sealing attempt shared by this immutable pack.
+    pub attempt_id: rs3_types::PayloadAttemptId,
     /// Historical content-encryption key needed to open the record.
     pub content_key_id: KeyId,
     /// Historical encrypted-keyring envelope object bound into payload AEAD context.
@@ -140,50 +114,16 @@ pub struct V2PackCarrierReference {
 
 /// Record-specific authenticated facts inside an accepted payload pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct V2PackRecordReference {
+pub struct V3PackRecordReference {
     /// Logical record ordinal in the pack directory.
     pub record_ordinal: u32,
     /// Absolute ciphertext offset from the start of the payload-pack section.
     pub record_offset: u32,
 }
 
-/// Exact accepted commit and section facts for a streamed payload.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct V2CommitStreamCarrierReference {
-    /// Commit object key containing the payload section.
-    pub commit_key: BackendObjectId,
-    /// Provider version identifier for exact-version reads, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit_version_id: Option<BackendVersionId>,
-    /// Commit body digest from the signed header.
-    pub body_digest: [u8; 32],
-    /// Provider-reported complete commit-object length.
-    pub commit_stored_len: u64,
-    /// Historical encrypted-keyring envelope object bound into payload AEAD context.
-    pub keyring_envelope_object_id: BackendObjectId,
-    /// SHA-256 digest of that encrypted-keyring envelope.
-    pub keyring_envelope_digest: [u8; 32],
-    /// Signed section ordinal containing the streamed payload.
-    pub payload_section_ordinal: u32,
-    /// Signed digest of the complete streamed payload section.
-    pub payload_section_digest: [u8; 32],
-    /// Opaque payload identity used as the AEAD associated-data object id.
-    pub payload_id: BackendObjectId,
-    /// Parsed segmented-payload header needed for direct range reads.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload_header: Option<PayloadHeaderReference>,
-    /// Absolute byte offset where the containing commit's section region starts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sections_start: Option<u64>,
-    /// Byte offset relative to the commit section region.
-    pub offset: u64,
-    /// Encrypted payload-section byte length.
-    pub length: u64,
-}
-
 /// Exact accepted standalone object facts for a streamed payload.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct V2StandaloneStreamCarrierReference {
+pub struct V3StandaloneStreamCarrierReference {
     /// Standalone backend object containing the encrypted payload.
     pub object_id: BackendObjectId,
     /// Provider version identifier for exact-version reads, when available.
@@ -197,23 +137,74 @@ pub struct V2StandaloneStreamCarrierReference {
     pub keyring_envelope_object_id: BackendObjectId,
     /// SHA-256 digest of that encrypted-keyring envelope.
     pub keyring_envelope_digest: [u8; 32],
-    /// Parsed segmented-payload header needed for direct range reads.
-    pub payload_header: PayloadHeaderReference,
+    /// Authenticated selected-part layout needed for direct range reads.
+    pub payload_layout: PayloadLayout,
 }
 
-/// Signed/encrypted payload-header facts used to plan direct range reads.
+/// Maximum independently sealed parts in a detached payload.
+pub const MAX_PAYLOAD_PARTS: usize = 10_000;
+
+/// One selected independently sealed part, in original part-number order.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PayloadHeaderReference {
-    /// Plaintext bytes per independently encrypted segment.
-    pub chunk_size: u64,
-    /// Total plaintext payload length.
+pub struct PayloadPart {
+    /// Original positive client part number, at most 10,000.
+    pub part_number: u32,
+    /// Fresh identity for this exact sealing attempt.
+    pub attempt_id: rs3_types::PayloadAttemptId,
+    /// Positive plaintext length of this selected part.
     pub plaintext_len: u64,
-    /// Content-encryption key identifier.
+}
+
+/// Authenticated encrypted layout of a ciphertext-only detached payload.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PayloadLayout {
+    /// Plaintext bytes per segment, except the final segment of each part.
+    pub chunk_size: u64,
+    /// Sum of all selected part lengths.
+    pub plaintext_len: u64,
+    /// Historical content-encryption key identifier.
     pub key_id: KeyId,
-    /// Per-payload nonce prefix used for segment nonce derivation.
-    pub nonce_prefix: [u8; 16],
-    /// Encoded payload-header byte length.
-    pub header_len: u64,
+    /// Random immutable carrier identity.
+    pub carrier_id: [u8; 32],
+    /// Ordered selected parts. Zero-length values have no backend carrier.
+    pub parts: Vec<PayloadPart>,
+}
+
+impl PayloadLayout {
+    /// Validates bounds, part order and lengths, returning exact ciphertext bytes.
+    /// Invalid layouts and arithmetic overflow return `None`.
+    #[must_use]
+    pub fn stored_len(&self) -> Option<u64> {
+        if self.chunk_size == 0
+            || self.chunk_size > 64 * 1024 * 1024
+            || self.plaintext_len == 0
+            || self.parts.is_empty()
+            || self.parts.len() > MAX_PAYLOAD_PARTS
+            || self.key_id.as_str().is_empty()
+            || self.key_id.as_str().len() > 255
+        {
+            return None;
+        }
+        let mut previous = 0;
+        let mut plaintext = 0_u64;
+        let mut stored = 0_u64;
+        for part in &self.parts {
+            if part.part_number <= previous
+                || part.part_number > MAX_PAYLOAD_PARTS as u32
+                || part.plaintext_len == 0
+            {
+                return None;
+            }
+            previous = part.part_number;
+            plaintext = plaintext.checked_add(part.plaintext_len)?;
+            let tags = part
+                .plaintext_len
+                .div_ceil(self.chunk_size)
+                .checked_mul(rs3_types::PAYLOAD_AEAD_TAG_LEN as u64)?;
+            stored = stored.checked_add(part.plaintext_len.checked_add(tags)?)?;
+        }
+        (plaintext == self.plaintext_len).then_some(stored)
+    }
 }
 
 /// A single index mutation.
@@ -270,28 +261,6 @@ impl fmt::Debug for IndexDelta {
     }
 }
 
-/// Durable index delta object referenced by a checkpoint.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexDeltaObject {
-    /// Repository sequence represented by this delta batch.
-    pub sequence: Sequence,
-    /// Ordered index mutations to replay.
-    pub deltas: Vec<IndexDelta>,
-}
-
-/// Sealed index delta object stored in the backend and referenced by a checkpoint.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SealedIndexDeltaObject {
-    /// Metadata key that sealed the payload.
-    pub key_id: KeyId,
-    /// Nonce used for the sealed payload.
-    pub nonce: Vec<u8>,
-    /// Sealed index delta payload.
-    pub ciphertext: Vec<u8>,
-    /// Authentication tag over the index delta object context.
-    pub tag: Vec<u8>,
-}
-
 /// Client-visible metadata stored in a sealed manifest object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableManifest {
@@ -306,6 +275,11 @@ pub struct DurableManifest {
     /// Effective legal-hold status, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legal_hold: Option<LegalHoldStatus>,
+    /// Trusted plaintext MD5 ETag for this object.
+    pub etag: ObjectEtag,
+    /// Client-declared checksum accepted for the complete object, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<rs3_types::ObjectChecksum>,
 }
 
 /// Sealed client-visible metadata embedded in an index delta.
@@ -321,41 +295,7 @@ pub struct ManifestObject {
     pub tag: Vec<u8>,
 }
 
-/// Public keyring metadata captured in a checkpoint.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeyringSnapshot {
-    /// Public descriptors for repository keys.
-    pub keys: Vec<KeyDescriptor>,
-}
-
-impl KeyringSnapshot {
-    /// Creates a deterministic keyring snapshot.
-    pub fn new(mut keys: Vec<KeyDescriptor>) -> Self {
-        keys.sort_by(|left, right| {
-            left.purpose
-                .cmp(&right.purpose)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Self { keys }
-    }
-
-    /// Finds the primary key descriptor for a purpose.
-    pub fn primary_for(&self, purpose: KeyPurpose) -> Option<&KeyDescriptor> {
-        self.keys
-            .iter()
-            .find(|key| key.purpose == purpose && key.status == KeyStatus::Primary)
-    }
-
-    /// Returns descriptors enabled for read, verify, or lookup for a purpose.
-    pub fn enabled_for(&self, purpose: KeyPurpose) -> Vec<&KeyDescriptor> {
-        self.keys
-            .iter()
-            .filter(|key| key.purpose == purpose && key.status.is_enabled_for_lookup())
-            .collect()
-    }
-}
-
-/// Public reference to the encrypted keyring envelope active for a checkpoint.
+/// Exact reference to an encrypted keyring envelope used by the repository.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyringEnvelopeReference {
     /// Envelope generation assigned by the operator workflow.
@@ -367,120 +307,6 @@ pub struct KeyringEnvelopeReference {
     /// Provider version identifier for the encrypted envelope, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<BackendVersionId>,
-}
-
-/// Signed checkpoint payload before signature wrapping.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitRecord {
-    /// Checkpoint sequence.
-    pub sequence: Sequence,
-    /// Checkpoint publish timestamp in milliseconds since the Unix epoch.
-    pub published_at_ms: i64,
-    /// Previous checkpoint, if any.
-    pub parent: Option<CheckpointId>,
-    /// Provider version identifier for the previous checkpoint object, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_checkpoint_version_id: Option<BackendVersionId>,
-    /// Referenced durable index delta objects.
-    pub index_deltas: Vec<BackendObjectRef>,
-    /// Sealed index delta embedded directly in this checkpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inline_index_delta: Option<SealedIndexDeltaObject>,
-    /// Referenced compacted manifest objects.
-    pub compacted_manifests: Vec<ManifestId>,
-    /// Public keyring metadata active for this checkpoint.
-    pub keyring: KeyringSnapshot,
-    /// Encrypted keyring envelope active for this checkpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keyring_envelope: Option<KeyringEnvelopeReference>,
-}
-
-impl CommitRecord {
-    /// Returns a normalized copy for deterministic checkpoint encoding.
-    pub fn canonicalized(&self) -> Self {
-        let mut record = self.clone();
-        record.index_deltas.sort();
-        record.compacted_manifests.sort();
-        record.keyring = KeyringSnapshot::new(record.keyring.keys);
-        record
-    }
-}
-
-/// Published checkpoint with signature material.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Checkpoint {
-    /// Checkpoint identifier.
-    pub id: CheckpointId,
-    /// Signed checkpoint payload.
-    pub record: CommitRecord,
-    /// Key that produced the signature.
-    pub signature_key_id: KeyId,
-    /// Signature bytes over the canonical checkpoint payload.
-    pub signature: Vec<u8>,
-}
-
-impl Checkpoint {
-    /// Returns the checkpoint sequence.
-    pub const fn sequence(&self) -> Sequence {
-        self.record.sequence
-    }
-}
-
-/// Storage-side evidence that a checkpoint was published.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckpointEvidence {
-    /// Checkpoint sequence.
-    pub sequence: Sequence,
-    /// Checkpoint identifier.
-    pub checkpoint_id: CheckpointId,
-    /// Digest of the canonical checkpoint payload.
-    pub checkpoint_digest: String,
-    /// Backend object that stores the signed checkpoint.
-    pub checkpoint_object_id: BackendObjectId,
-    /// Provider version identifier for the signed checkpoint object, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint_object_version_id: Option<BackendVersionId>,
-}
-
-/// Encodes a checkpoint payload into deterministic signed bytes.
-pub fn canonical_commit_record_bytes(record: &CommitRecord) -> Result<Vec<u8>, serde_json::Error> {
-    let mut bytes = CHECKPOINT_RECORD_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, &record.canonicalized())?;
-    Ok(bytes)
-}
-
-/// Encodes a durable checkpoint object.
-pub fn checkpoint_object_bytes(checkpoint: &Checkpoint) -> Result<Vec<u8>, serde_json::Error> {
-    let mut checkpoint = checkpoint.clone();
-    checkpoint.record = checkpoint.record.canonicalized();
-    let mut bytes = CHECKPOINT_OBJECT_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, &checkpoint)?;
-    Ok(bytes)
-}
-
-/// Encodes durable checkpoint evidence.
-pub fn checkpoint_evidence_bytes(
-    evidence: &CheckpointEvidence,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let mut bytes = CHECKPOINT_EVIDENCE_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, evidence)?;
-    Ok(bytes)
-}
-
-/// Encodes a durable sealed index delta object.
-pub fn index_delta_object_bytes(
-    delta: &SealedIndexDeltaObject,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let mut bytes = INDEX_DELTA_OBJECT_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, delta)?;
-    Ok(bytes)
-}
-
-/// Encodes index delta plaintext before sealing.
-pub fn index_delta_plaintext_bytes(delta: &IndexDeltaObject) -> Result<Vec<u8>, serde_json::Error> {
-    let mut bytes = INDEX_DELTA_PLAINTEXT_DOMAIN.to_vec();
-    serde_json::to_writer(&mut bytes, delta)?;
-    Ok(bytes)
 }
 
 /// Encodes manifest plaintext before sealing.
@@ -502,7 +328,7 @@ pub struct NamespaceEntry {
     /// Provider version identifier for exact restore reads, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_version_id: Option<BackendVersionId>,
-    /// Commit-backed payload location for v2 repositories.
+    /// Commit-backed payload location for v3 repositories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_ref: Option<PayloadReference>,
     /// Sealed metadata record containing client-visible metadata.
@@ -520,15 +346,6 @@ pub struct NamespaceEntry {
     pub legal_hold: Option<LegalHoldStatus>,
 }
 
-/// Tombstone for a removed namespace entry.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NamespaceTombstone {
-    /// Blind key removed by this tombstone.
-    pub blind_key: BlindIndexKey,
-    /// Repository generation that made the tombstone visible.
-    pub generation: Sequence,
-}
-
 /// In-memory trusted namespace index.
 ///
 /// This is not the durable encrypted index format. It is the query model used
@@ -539,7 +356,6 @@ pub struct NamespaceIndex {
     entries: BTreeMap<BlindIndexKey, NamespaceEntry>,
     entry_prefixes: BTreeMap<BlindIndexKey, BTreeSet<PrefixToken>>,
     prefixes: BTreeMap<PrefixToken, BTreeSet<BlindIndexKey>>,
-    tombstones: BTreeMap<BlindIndexKey, NamespaceTombstone>,
 }
 
 /// Opaque snapshot of one namespace-index key for transactional rollback.
@@ -551,7 +367,6 @@ pub struct NamespaceIndexKeySnapshot {
     blind_key: BlindIndexKey,
     entry: Option<NamespaceEntry>,
     prefix_tokens: Vec<PrefixToken>,
-    tombstone: Option<NamespaceTombstone>,
 }
 
 impl NamespaceIndex {
@@ -563,7 +378,6 @@ impl NamespaceIndex {
     /// Inserts or replaces an entry and associates it with prefix tokens.
     pub fn upsert(&mut self, entry: NamespaceEntry, prefix_tokens: Vec<PrefixToken>) {
         self.remove_prefix_membership(&entry.blind_key);
-        self.tombstones.remove(&entry.blind_key);
 
         let prefix_set = prefix_tokens.into_iter().collect::<BTreeSet<_>>();
         for prefix_token in &prefix_set {
@@ -604,7 +418,7 @@ impl NamespaceIndex {
         self.entry_prefixes.get(blind_key).into_iter().flatten()
     }
 
-    /// Captures one key's live entry, prefix membership, and tombstone.
+    /// Captures one key's live entry and prefix membership.
     pub fn snapshot_key(&self, blind_key: &BlindIndexKey) -> NamespaceIndexKeySnapshot {
         NamespaceIndexKeySnapshot {
             blind_key: blind_key.clone(),
@@ -614,7 +428,6 @@ impl NamespaceIndex {
                 .get(blind_key)
                 .map(|tokens| tokens.iter().cloned().collect())
                 .unwrap_or_default(),
-            tombstone: self.tombstones.get(blind_key).cloned(),
         }
     }
 
@@ -622,13 +435,9 @@ impl NamespaceIndex {
     pub fn restore_key(&mut self, snapshot: NamespaceIndexKeySnapshot) {
         self.entries.remove(&snapshot.blind_key);
         self.remove_prefix_membership(&snapshot.blind_key);
-        self.tombstones.remove(&snapshot.blind_key);
 
         if let Some(entry) = snapshot.entry {
             self.upsert(entry, snapshot.prefix_tokens);
-        }
-        if let Some(tombstone) = snapshot.tombstone {
-            self.tombstones.insert(snapshot.blind_key, tombstone);
         }
     }
 
@@ -642,22 +451,11 @@ impl NamespaceIndex {
             .collect()
     }
 
-    /// Writes a tombstone and removes the live entry from prefix lists.
-    pub fn tombstone(&mut self, blind_key: BlindIndexKey, generation: Sequence) {
-        self.entries.remove(&blind_key);
-        self.remove_prefix_membership(&blind_key);
-        self.tombstones.insert(
-            blind_key.clone(),
-            NamespaceTombstone {
-                blind_key,
-                generation,
-            },
-        );
-    }
-
-    /// Looks up a tombstone by blind key.
-    pub fn tombstone_for(&self, blind_key: &BlindIndexKey) -> Option<&NamespaceTombstone> {
-        self.tombstones.get(blind_key)
+    /// Removes an entry from the live query index and its prefix lists.
+    /// Durable tombstones and generation checks belong to authenticated index runs.
+    pub fn remove(&mut self, blind_key: &BlindIndexKey) {
+        self.entries.remove(blind_key);
+        self.remove_prefix_membership(blind_key);
     }
 
     fn remove_prefix_membership(&mut self, blind_key: &BlindIndexKey) {
@@ -684,20 +482,14 @@ impl NamespaceIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKPOINT_EVIDENCE_DOMAIN, CHECKPOINT_OBJECT_DOMAIN, Checkpoint, CheckpointEvidence,
-        CommitRecord, INDEX_DELTA_OBJECT_DOMAIN, INDEX_DELTA_PLAINTEXT_DOMAIN, IndexDelta,
-        IndexDeltaObject, KeyringSnapshot, MANIFEST_PLAINTEXT_DOMAIN, ManifestObject,
-        NamespaceEntry, NamespaceIndex, PayloadReference, SealedIndexDeltaObject,
-        V2CommitStreamCarrierReference, V2PackCarrierReference, V2PackRecordReference,
-        V2StandaloneStreamCarrierReference, canonical_commit_record_bytes,
-        checkpoint_evidence_bytes, checkpoint_object_bytes, index_delta_object_bytes,
-        index_delta_plaintext_bytes, manifest_plaintext_bytes,
+        IndexDelta, MANIFEST_PLAINTEXT_DOMAIN, NamespaceEntry, NamespaceIndex, PayloadReference,
+        V3PackCarrierReference, V3PackRecordReference, V3StandaloneStreamCarrierReference,
+        manifest_plaintext_bytes,
     };
     use rs3_types::{
-        BackendObjectId, BackendVersionId, BlindIndexKey, CheckpointId, KeyDescriptor, KeyId,
-        KeyPurpose, KeyStatus, LogicalPath, ManifestId, PrefixToken, Sequence,
+        BackendObjectId, BackendVersionId, BlindIndexKey, KeyId, LogicalPath, ManifestId,
+        ObjectEtag, PrefixToken, Sequence,
     };
-    use serde::Serialize;
     use std::sync::Arc;
 
     fn blind_key(value: &str) -> BlindIndexKey {
@@ -742,27 +534,6 @@ mod tests {
         }
     }
 
-    fn checkpoint_id(value: &str) -> CheckpointId {
-        match CheckpointId::new(value) {
-            Ok(value) => value,
-            Err(error) => panic!("{error}"),
-        }
-    }
-
-    fn key_descriptor(id: &str, purpose: KeyPurpose, status: KeyStatus) -> KeyDescriptor {
-        KeyDescriptor {
-            id: key_id(id),
-            purpose,
-            algorithm: "hmac-sha256".to_string(),
-            status,
-            created_at_ms: 0,
-            not_before_ms: None,
-            not_after_ms: None,
-            public_key: None,
-            external_kms_uri: None,
-        }
-    }
-
     fn entry(blind_key: BlindIndexKey, object_id: BackendObjectId) -> NamespaceEntry {
         NamespaceEntry {
             namespace_key_id: key_id("namespace-a"),
@@ -776,15 +547,6 @@ mod tests {
             generation: Sequence::new(1),
             retention: None,
             legal_hold: None,
-        }
-    }
-
-    fn sealed_manifest() -> ManifestObject {
-        ManifestObject {
-            key_id: key_id("metadata"),
-            nonce: vec![1, 2, 3],
-            ciphertext: vec![4, 5, 6],
-            tag: vec![7, 8, 9],
         }
     }
 
@@ -815,181 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn commit_record_starts_without_parent() {
-        let record = CommitRecord {
-            sequence: Sequence::ZERO,
-            published_at_ms: 0,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: Vec::new(),
-            inline_index_delta: None,
-            compacted_manifests: Vec::new(),
-            keyring: KeyringSnapshot::default(),
-            keyring_envelope: None,
-        };
-
-        assert!(record.parent.is_none());
-    }
-
-    #[test]
-    fn canonical_commit_record_encoding_is_stable() {
-        let unsorted = CommitRecord {
-            sequence: Sequence::new(3),
-            published_at_ms: 123,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: vec![
-                object_id("segments/b").into(),
-                object_id("segments/a").into(),
-            ],
-            inline_index_delta: None,
-            compacted_manifests: vec![manifest_id("manifest-b"), manifest_id("manifest-a")],
-            keyring: KeyringSnapshot::new(vec![
-                key_descriptor("old", KeyPurpose::Namespace, KeyStatus::Enabled),
-                key_descriptor("new", KeyPurpose::Namespace, KeyStatus::Primary),
-            ]),
-            keyring_envelope: None,
-        };
-        let sorted = CommitRecord {
-            sequence: Sequence::new(3),
-            published_at_ms: 123,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: vec![
-                object_id("segments/a").into(),
-                object_id("segments/b").into(),
-            ],
-            inline_index_delta: None,
-            compacted_manifests: vec![manifest_id("manifest-a"), manifest_id("manifest-b")],
-            keyring: KeyringSnapshot::new(vec![
-                key_descriptor("new", KeyPurpose::Namespace, KeyStatus::Primary),
-                key_descriptor("old", KeyPurpose::Namespace, KeyStatus::Enabled),
-            ]),
-            keyring_envelope: None,
-        };
-
-        let left = canonical_commit_record_bytes(&unsorted);
-        let right = canonical_commit_record_bytes(&sorted);
-
-        assert!(left.is_ok());
-        assert_eq!(left.ok(), right.ok());
-    }
-
-    #[test]
-    fn canonical_commit_record_encoding_changes_with_sequence() {
-        let first = CommitRecord {
-            sequence: Sequence::new(1),
-            published_at_ms: 123,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: Vec::new(),
-            inline_index_delta: None,
-            compacted_manifests: Vec::new(),
-            keyring: KeyringSnapshot::default(),
-            keyring_envelope: None,
-        };
-        let second = CommitRecord {
-            sequence: Sequence::new(2),
-            published_at_ms: 123,
-            parent: None,
-            parent_checkpoint_version_id: None,
-            index_deltas: Vec::new(),
-            inline_index_delta: None,
-            compacted_manifests: Vec::new(),
-            keyring: KeyringSnapshot::default(),
-            keyring_envelope: None,
-        };
-
-        let first_bytes = canonical_commit_record_bytes(&first);
-        let second_bytes = canonical_commit_record_bytes(&second);
-
-        assert!(first_bytes.is_ok());
-        assert!(second_bytes.is_ok());
-        assert_ne!(first_bytes.ok(), second_bytes.ok());
-    }
-
-    #[test]
-    fn checkpoint_object_encoding_has_domain_prefix() {
-        let checkpoint = Checkpoint {
-            id: checkpoint_id("checkpoint-a"),
-            record: CommitRecord {
-                sequence: Sequence::new(1),
-                published_at_ms: 123,
-                parent: None,
-                parent_checkpoint_version_id: None,
-                index_deltas: Vec::new(),
-                inline_index_delta: None,
-                compacted_manifests: Vec::new(),
-                keyring: KeyringSnapshot::default(),
-                keyring_envelope: None,
-            },
-            signature_key_id: key_id("signing"),
-            signature: vec![1, 2, 3],
-        };
-
-        let encoded = checkpoint_object_bytes(&checkpoint);
-
-        assert!(matches!(
-            encoded,
-            Ok(bytes) if bytes.starts_with(CHECKPOINT_OBJECT_DOMAIN)
-        ));
-    }
-
-    #[test]
-    fn checkpoint_evidence_encoding_has_domain_prefix() {
-        let evidence = CheckpointEvidence {
-            sequence: Sequence::new(1),
-            checkpoint_id: checkpoint_id("checkpoint-a"),
-            checkpoint_digest: "digest-a".to_owned(),
-            checkpoint_object_id: object_id("checkpoints/checkpoint-a"),
-            checkpoint_object_version_id: None,
-        };
-
-        let encoded = checkpoint_evidence_bytes(&evidence);
-
-        assert!(matches!(
-            encoded,
-            Ok(bytes) if bytes.starts_with(CHECKPOINT_EVIDENCE_DOMAIN)
-        ));
-    }
-
-    #[test]
-    fn index_delta_object_encoding_has_domain_prefix() {
-        let delta = SealedIndexDeltaObject {
-            key_id: key_id("metadata"),
-            nonce: vec![1; 24],
-            ciphertext: vec![2; 32],
-            tag: vec![3; 16],
-        };
-
-        let encoded = index_delta_object_bytes(&delta);
-
-        assert!(matches!(
-            encoded,
-            Ok(bytes) if bytes.starts_with(INDEX_DELTA_OBJECT_DOMAIN)
-        ));
-    }
-
-    #[test]
-    fn index_delta_plaintext_encoding_has_domain_prefix() {
-        let delta = IndexDeltaObject {
-            sequence: Sequence::new(1),
-            deltas: vec![IndexDelta::Upsert {
-                entry: Box::new(entry(blind_key("blind-a"), object_id("segments/opaque-a"))),
-                prefix_tokens: vec![prefix_token("prefix-a")],
-                sealed_manifest: Box::new(sealed_manifest()),
-            }],
-        };
-
-        let encoded = index_delta_plaintext_bytes(&delta);
-
-        assert!(matches!(
-            encoded,
-            Ok(bytes) if bytes.starts_with(INDEX_DELTA_PLAINTEXT_DOMAIN)
-        ));
-    }
-
-    #[test]
     fn manifest_plaintext_encoding_has_domain_prefix() {
         let manifest = super::DurableManifest {
             key: logical_path("p/12/object"),
@@ -997,6 +584,8 @@ mod tests {
             modified_at_ms: 7,
             retention: None,
             legal_hold: None,
+            etag: ObjectEtag::single(rs3_types::Md5Digest::from_bytes([0x55; 16])),
+            checksum: None,
         };
 
         let plaintext = manifest_plaintext_bytes(&manifest);
@@ -1008,33 +597,9 @@ mod tests {
     }
 
     #[test]
-    fn keyring_snapshot_tracks_primary_and_enabled_keys() {
-        let snapshot = KeyringSnapshot::new(vec![
-            key_descriptor("old", KeyPurpose::Namespace, KeyStatus::Enabled),
-            key_descriptor("new", KeyPurpose::Namespace, KeyStatus::Primary),
-            key_descriptor("disabled", KeyPurpose::Namespace, KeyStatus::Disabled),
-        ]);
-
-        assert_eq!(
-            snapshot
-                .primary_for(KeyPurpose::Namespace)
-                .map(|key| key.id.clone()),
-            Some(key_id("new"))
-        );
-        assert_eq!(
-            snapshot
-                .enabled_for(KeyPurpose::Namespace)
-                .into_iter()
-                .map(|key| key.id.clone())
-                .collect::<Vec<_>>(),
-            vec![key_id("new"), key_id("old")]
-        );
-    }
-
-    #[test]
     fn payload_pack_references_round_trip_direct_read_facts() {
-        let accepted = PayloadReference::V2Pack {
-            carrier: Arc::new(V2PackCarrierReference {
+        let accepted = PayloadReference::V3Pack {
+            carrier: Arc::new(V3PackCarrierReference {
                 commit_key: object_id("commits/opaque"),
                 commit_version_id: Some(BackendVersionId::new("version-1").expect("version id")),
                 body_digest: [0x33; 32],
@@ -1043,20 +608,22 @@ mod tests {
                 pack_offset: 8_192,
                 length: 16_384,
                 pack_id: [0x44; 32],
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
                 content_key_id: key_id("older-content"),
                 keyring_envelope_object_id: object_id("keyrings/historical"),
                 keyring_envelope_digest: [0x45; 32],
                 pack_record_count: 11,
             }),
-            record: V2PackRecordReference {
+            record: V3PackRecordReference {
                 record_ordinal: 5,
                 record_offset: 12_288,
             },
         };
         let references = [
-            PayloadReference::V2PackSelf {
+            PayloadReference::V3PackSelf {
                 pack_section_ordinal: 2,
                 pack_id: [0x11; 32],
+                attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
                 content_key_id: key_id("historical-content"),
                 keyring_envelope_object_id: object_id("keyrings/current"),
                 keyring_envelope_digest: [0x12; 32],
@@ -1075,48 +642,9 @@ mod tests {
         }
     }
 
-    #[derive(Serialize)]
-    enum LegacyPayloadReference<'a> {
-        V2Pack {
-            commit_key: &'a BackendObjectId,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            commit_version_id: &'a Option<BackendVersionId>,
-            body_digest: [u8; 32],
-            commit_stored_len: u64,
-            pack_section_ordinal: u32,
-            pack_offset: u64,
-            length: u64,
-            pack_id: [u8; 32],
-            content_key_id: &'a KeyId,
-            keyring_envelope_object_id: &'a BackendObjectId,
-            keyring_envelope_digest: [u8; 32],
-            pack_record_count: u32,
-            record_ordinal: u32,
-            record_offset: u32,
-        },
-        V2CommitStream {
-            commit_key: &'a BackendObjectId,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            commit_version_id: &'a Option<BackendVersionId>,
-            body_digest: [u8; 32],
-            commit_stored_len: u64,
-            keyring_envelope_object_id: &'a BackendObjectId,
-            keyring_envelope_digest: [u8; 32],
-            payload_section_ordinal: u32,
-            payload_section_digest: [u8; 32],
-            payload_id: &'a BackendObjectId,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            payload_header: &'a Option<super::PayloadHeaderReference>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            sections_start: &'a Option<u64>,
-            offset: u64,
-            length: u64,
-        },
-    }
-
     #[test]
-    fn shared_payload_pack_reference_preserves_the_flat_serialized_shape() {
-        let carrier = Arc::new(V2PackCarrierReference {
+    fn shared_payload_pack_reference_round_trips() {
+        let carrier = Arc::new(V3PackCarrierReference {
             commit_key: object_id("commits/opaque"),
             commit_version_id: Some(BackendVersionId::new("version-1").expect("version id")),
             body_digest: [0x33; 32],
@@ -1125,106 +653,47 @@ mod tests {
             pack_offset: 8_192,
             length: 16_384,
             pack_id: [0x44; 32],
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
             content_key_id: key_id("older-content"),
             keyring_envelope_object_id: object_id("keyrings/historical"),
             keyring_envelope_digest: [0x45; 32],
             pack_record_count: 11,
         });
-        let record = V2PackRecordReference {
+        let record = V3PackRecordReference {
             record_ordinal: 5,
             record_offset: 12_288,
         };
-        let shared = PayloadReference::V2Pack {
+        let shared = PayloadReference::V3Pack {
             carrier: Arc::clone(&carrier),
             record,
         };
-        let legacy = LegacyPayloadReference::V2Pack {
-            commit_key: &carrier.commit_key,
-            commit_version_id: &carrier.commit_version_id,
-            body_digest: carrier.body_digest,
-            commit_stored_len: carrier.commit_stored_len,
-            pack_section_ordinal: carrier.pack_section_ordinal,
-            pack_offset: carrier.pack_offset,
-            length: carrier.length,
-            pack_id: carrier.pack_id,
-            content_key_id: &carrier.content_key_id,
-            keyring_envelope_object_id: &carrier.keyring_envelope_object_id,
-            keyring_envelope_digest: carrier.keyring_envelope_digest,
-            pack_record_count: carrier.pack_record_count,
-            record_ordinal: record.record_ordinal,
-            record_offset: record.record_offset,
-        };
-
+        let bytes = serde_json::to_vec(&shared).expect("encode pack reference");
         assert_eq!(
-            serde_json::to_vec(&shared).expect("serialize shared payload reference"),
-            serde_json::to_vec(&legacy).expect("serialize legacy payload reference")
-        );
-    }
-
-    #[test]
-    fn shared_stream_reference_preserves_the_flat_serialized_shape() {
-        let carrier = Arc::new(V2CommitStreamCarrierReference {
-            commit_key: object_id("commits/stream"),
-            commit_version_id: Some(BackendVersionId::new("version-2").expect("version id")),
-            body_digest: [0x61; 32],
-            commit_stored_len: 65_536,
-            keyring_envelope_object_id: object_id("keyrings/stream"),
-            keyring_envelope_digest: [0x62; 32],
-            payload_section_ordinal: 3,
-            payload_section_digest: [0x63; 32],
-            payload_id: object_id("payloads/stream"),
-            payload_header: Some(super::PayloadHeaderReference {
-                chunk_size: 64 * 1024,
-                plaintext_len: 123_456,
-                key_id: key_id("stream-content"),
-                nonce_prefix: [0x64; 16],
-                header_len: 96,
-            }),
-            sections_start: Some(8_192),
-            offset: 17,
-            length: 123_789,
-        });
-        let shared = PayloadReference::V2CommitStream {
-            carrier: Arc::clone(&carrier),
-        };
-        let legacy = LegacyPayloadReference::V2CommitStream {
-            commit_key: &carrier.commit_key,
-            commit_version_id: &carrier.commit_version_id,
-            body_digest: carrier.body_digest,
-            commit_stored_len: carrier.commit_stored_len,
-            keyring_envelope_object_id: &carrier.keyring_envelope_object_id,
-            keyring_envelope_digest: carrier.keyring_envelope_digest,
-            payload_section_ordinal: carrier.payload_section_ordinal,
-            payload_section_digest: carrier.payload_section_digest,
-            payload_id: &carrier.payload_id,
-            payload_header: &carrier.payload_header,
-            sections_start: &carrier.sections_start,
-            offset: carrier.offset,
-            length: carrier.length,
-        };
-
-        assert_eq!(
-            serde_json::to_vec(&shared).expect("serialize shared stream reference"),
-            serde_json::to_vec(&legacy).expect("serialize legacy stream reference")
+            serde_json::from_slice::<PayloadReference>(&bytes).expect("decode pack reference"),
+            shared
         );
     }
 
     #[test]
     fn standalone_stream_reference_round_trips_its_distinct_typed_shape() {
-        let reference = PayloadReference::V2StandaloneStream {
-            carrier: Arc::new(V2StandaloneStreamCarrierReference {
-                object_id: object_id("objects/v02/standalone-stream"),
+        let reference = PayloadReference::V3StandaloneStream {
+            carrier: Arc::new(V3StandaloneStreamCarrierReference {
+                object_id: object_id("objects/v03/standalone-stream"),
                 version_id: Some(BackendVersionId::new("version-3").expect("version id")),
                 object_digest: [0x71; 32],
                 stored_len: 131_233,
                 keyring_envelope_object_id: object_id("keyrings/standalone"),
                 keyring_envelope_digest: [0x72; 32],
-                payload_header: super::PayloadHeaderReference {
+                payload_layout: super::PayloadLayout {
                     chunk_size: 64 * 1024,
                     plaintext_len: 131_072,
                     key_id: key_id("standalone-content"),
-                    nonce_prefix: [0x73; 16],
-                    header_len: 113,
+                    carrier_id: [0x73; 32],
+                    parts: vec![crate::PayloadPart {
+                        part_number: 1,
+                        attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+                        plaintext_len: 131_072,
+                    }],
                 },
             }),
         };
@@ -1289,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_tombstone_removes_live_entry_from_prefix() {
+    fn namespace_removal_clears_live_entry_and_prefix() {
         let mut index = NamespaceIndex::new();
         let blind_key = blind_key("blind-a");
         let prefix_token = prefix_token("prefix-p");
@@ -1298,20 +767,14 @@ mod tests {
             entry(blind_key.clone(), object_id("segments/opaque-a")),
             vec![prefix_token.clone()],
         );
-        index.tombstone(blind_key.clone(), Sequence::new(2));
+        index.remove(&blind_key);
 
         assert!(index.head(&blind_key).is_none());
         assert!(index.list_prefix(&prefix_token).is_empty());
-        assert_eq!(
-            index
-                .tombstone_for(&blind_key)
-                .map(|tombstone| tombstone.generation),
-            Some(Sequence::new(2))
-        );
     }
 
     #[test]
-    fn namespace_key_snapshot_restores_entry_prefixes_and_tombstone() {
+    fn namespace_key_snapshot_restores_entry_and_prefixes_after_removal() {
         let mut index = NamespaceIndex::new();
         let blind_key = blind_key("blind-a");
         let old_prefix = prefix_token("prefix-old");
@@ -1329,7 +792,7 @@ mod tests {
             entry(blind_key.clone(), object_id("segments/opaque-new")),
             vec![new_prefix.clone()],
         );
-        index.tombstone(blind_key.clone(), Sequence::new(9));
+        index.remove(&blind_key);
         index.restore_key(snapshot);
 
         assert_eq!(
@@ -1338,7 +801,6 @@ mod tests {
         );
         assert_eq!(index.list_prefix(&old_prefix).len(), 1);
         assert!(index.list_prefix(&new_prefix).is_empty());
-        assert!(index.tombstone_for(&blind_key).is_none());
     }
 
     #[test]
@@ -1366,5 +828,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![object_id("segments/opaque-b")]
         );
+    }
+
+    #[test]
+    fn absent_key_snapshot_rollback_preserves_unrelated_changes() {
+        let mut index = NamespaceIndex::new();
+        let staged = blind_key("staged");
+        let unrelated = blind_key("unrelated");
+        let prefix = prefix_token("shared-prefix");
+        let snapshot = index.snapshot_key(&staged);
+        index.upsert(
+            entry(staged.clone(), object_id("objects/staged")),
+            vec![prefix.clone()],
+        );
+        index.upsert(
+            entry(unrelated.clone(), object_id("objects/accepted")),
+            vec![prefix.clone()],
+        );
+
+        index.restore_key(snapshot);
+
+        assert!(index.head(&staged).is_none());
+        assert_eq!(
+            index.list_prefix(&prefix),
+            vec![index.head(&unrelated).expect("unrelated entry")]
+        );
+        assert_eq!(index.live_entries().count(), 1);
     }
 }

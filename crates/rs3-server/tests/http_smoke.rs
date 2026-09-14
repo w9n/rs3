@@ -127,7 +127,7 @@ fn runtime_config() -> RuntimeConfig {
             max_pending_items: 64,
         },
         repository: RepositoryConfig {
-            format: rs3_server::RepositoryFormat::V2Preview,
+            format: rs3_server::RepositoryFormat::V3Preview,
             payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
             adaptive_payload_segment_size: true,
             decrypted_segment_cache_max_bytes:
@@ -141,10 +141,11 @@ fn runtime_config() -> RuntimeConfig {
         repository_keys: RepositoryKeysConfig {
             repository_id: RepositoryId::new("test-repository")
                 .unwrap_or_else(|error| panic!("{error}")),
-            repository_salt_hex: "2222222222222222222222222222222222222222222222222222222222222222"
-                .to_owned(),
+            repository_salt_hex: Some(
+                "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+            ),
             envelope_object_id: Some(
-                BackendObjectId::new("keyrings/test-envelope.json")
+                BackendObjectId::new("keyrings/test-envelope.cbor")
                     .unwrap_or_else(|error| panic!("{error}")),
             ),
             wrapping_key_id: "wrap-v1".to_owned(),

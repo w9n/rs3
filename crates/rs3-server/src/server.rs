@@ -44,6 +44,16 @@ impl GatewayServer {
         Self::bind_with_boundary(config, boundary).await
     }
 
+    /// Binds a readonly gateway to an authenticated historical commit.
+    pub async fn bind_with_recovery_point(
+        config: RuntimeConfig,
+        sequence: rs3_types::Sequence,
+    ) -> Result<Self, GatewayServerError> {
+        let boundary =
+            GatewayS3Boundary::build_with_recovery_point(config.clone(), sequence).await?;
+        Self::bind_with_boundary(config, boundary).await
+    }
+
     /// Binds a gateway whose Kubernetes anchor updates are fenced by the
     /// supplied live writer epoch.
     #[cfg(feature = "k8s")]
@@ -298,7 +308,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
-                format: crate::RepositoryFormat::V2Preview,
+                format: crate::RepositoryFormat::V3Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -312,10 +322,11 @@ mod tests {
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),
-                repository_salt_hex:
+                repository_salt_hex: Some(
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+                ),
                 envelope_object_id: Some(
-                    BackendObjectId::new("keyrings/test-envelope.json")
+                    BackendObjectId::new("keyrings/test-envelope.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),
                 ),
                 wrapping_key_id: "wrap-v1".to_owned(),

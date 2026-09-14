@@ -1,3 +1,5 @@
+pub(super) use crate::retention::retention_is_active;
+use crate::retention::{retention_mode_strength, stronger_retention_mode};
 use crate::{BlobMetadata, Result, StorageError};
 use aws_sdk_s3::primitives::DateTime as SdkDateTime;
 use aws_sdk_s3::types::{
@@ -8,10 +10,6 @@ use rs3_types::{
     BackendObjectId, BackendVersionId, LegalHoldStatus, RetentionMode, RetentionPolicy,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-
-pub(super) fn retention_is_active(policy: &RetentionPolicy) -> bool {
-    policy.mode != RetentionMode::None && policy.retain_days > 0
-}
 
 pub(super) fn retention_blocks_delete(policy: Option<&RetentionPolicy>) -> bool {
     policy.is_some_and(retention_is_active)
@@ -229,11 +227,7 @@ pub(super) fn retention_satisfies(
     if !retention_is_active(requested) {
         return true;
     }
-    let Some(actual) = actual else {
-        return false;
-    };
-    retention_mode_strength(actual.mode) >= retention_mode_strength(requested.mode)
-        && actual.retain_days >= requested.retain_days
+    crate::retention_satisfies(actual, requested)
 }
 
 pub(super) fn retention_mode_label(mode: RetentionMode) -> &'static str {
@@ -269,22 +263,6 @@ fn legal_hold_satisfies(actual: Option<LegalHoldStatus>, requested: LegalHoldSta
     }
 }
 
-fn retention_mode_strength(mode: RetentionMode) -> u8 {
-    match mode {
-        RetentionMode::None => 0,
-        RetentionMode::Governance => 1,
-        RetentionMode::Compliance => 2,
-    }
-}
-
-fn stronger_retention_mode(left: RetentionMode, right: RetentionMode) -> RetentionMode {
-    if retention_mode_strength(left) >= retention_mode_strength(right) {
-        left
-    } else {
-        right
-    }
-}
-
 pub(super) fn current_epoch_ms() -> Result<i64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -312,7 +290,7 @@ mod tests {
     const DAY_MS: i64 = 86_400_000;
 
     fn object_id() -> BackendObjectId {
-        BackendObjectId::new("objects/v02/retention-test").unwrap_or_else(|error| panic!("{error}"))
+        BackendObjectId::new("objects/v03/retention-test").unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn version_id(value: &str) -> BackendVersionId {

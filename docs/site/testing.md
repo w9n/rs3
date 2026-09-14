@@ -1,5 +1,10 @@
 # Testing
 
+Use `just check` for workspace checks and `just fmt` for formatting. Operator
+keyring inspection, rewrap and bundle verification live in `rs3-server`;
+repository initialization uses `rs3-server init`. The xtask CLI contains
+integration lanes, performance tools and the isolated `repository gc-rehearsal` command.
+
 Testing is part of the architecture because privacy and rollback behavior are
 product requirements.
 
@@ -13,31 +18,183 @@ just check
 
 This runs formatting, clippy with warnings denied, and workspace tests.
 
+## v03 Codec Fixtures
+
+`cargo test -p rs3-repository --test v03_vectors` checks the signed commit
+fixtures. Workspace tests also pin index tables, roots, payload segments,
+repository envelopes and recovery bundles against `test-vectors/v03/`.
+That directory documents fixture keys, fixed test-only nonces and the named
+rejection tests. Fixed fixtures do not change production nonce generation.
+
+Repository multipart completion tests cover empty and detached values, receipt
+lookup after overwrite, checkpoint, compaction and restart, publication-time
+create-only checks, failed anchor advancement, lost anchor replies and local
+installation failure. Adapter tests also cover the five multipart routes, replacement serialization,
+parallel parts, completion freeze, duplicate completion, monotonic expiry,
+admission limits, cancellation, readonly mode and invalid selected/body facts.
+Checksum tests cover all five algorithms, encrypted metadata and completion
+receipt persistence, and failed writes that leave the accepted value intact.
+MD5/ETag tests cover empty, buffered, known-length, unknown-length and
+multipart paths, while `Content-MD5` tests cover canonical parsing, exact EOF
+validation, and failures that preserve the accepted object or part.
+`cargo test -p rs3-server --test checksum_trailers` sends authenticated SigV4
+chunks and trailers through the real listener, including missing and invalid
+trailer cases.
+
+Local flexible-checksum qualification covered 100 MiB AWS CLI 2.34.24 ordinary
+and multipart uploads with CRC64NVME and SHA256 on memory and RustFS. Velero
+1.18.0 with AWS plugin 1.14.0 passed default CRC32 backup and restore after
+namespace deletion. Those runs preceded the MD5 ETag format update.
+
+MD5 ETag qualification uses rclone 1.75.0 and AWS CLI 2.34.24 on memory and
+RustFS. Direct rclone single PUT validates Content-MD5 and returns the expected
+MD5 ETag; `md5sum` and hash-based `check` agree, while a same-size corrupted
+local file fails hash comparison. A rejected bad-MD5 overwrite preserves the
+accepted ETag and original bytes.
+
+Direct AWS two-part uploads validate each part's Content-MD5 and return the
+independently calculated MD5-of-part-MD5s ETag. Bad-MD5 part replacements leave
+the prior part usable, and direct rclone `check --download` verifies the
+completed bytes. These runs use 100 MiB objects and verify matching ETags from
+HEAD, GET and listing responses.
+
+The earlier MD5 qualification used AWS-created multipart objects because
+multipart creation then rejected rclone's Mtime metadata. Ordinary PUT and
+multipart creation now both accept user metadata without preserving it.
+These results qualify byte and ETag behavior, not metadata preservation or all
+rclone upload options. At revision `453c2ff`, the
+[corrected nightly run](https://github.com/w9n/rs3/actions/runs/34226674202)
+passed both the gateway-restart dynamic-PVC and PostgreSQL backup/restore Velero
+smokes. This is lane-scoped evidence and does not establish an overall nightly
+pass.
+
+`just integration-s3-gateway --tooling-smoke` requires AWS CLI v2, rclone, mc
+and restic. The repository's `nix develop` shell supplies these clients. It
+uses deterministic incompressible data above 8 MiB, verifies
+uploaded and restored bytes, and checks exact length and multipart ETags for
+AWS and rclone uploads. AWS uses an isolated configuration with an explicit
+8 MiB multipart threshold; rclone uses explicit settings that disable system
+metadata and its custom MD5 metadata. Restic initializes, backs up and restores
+a repository. A missing tool or failed required upload fails the lane. Generic
+user-metadata preservation is outside this preview compatibility contract.
+
+When a gateway exits during startup, the qualification harness attaches the
+final 80 captured log lines to that startup failure. When a Helm gateway
+installation fails, it attaches a capped failure excerpt containing selected-pod
+readiness, namespace events and selected-container logs before deleting the
+disposable kind cluster. The Helm excerpt redacts fixture credentials and
+configured backend paths; these diagnostics aid failure triage and do not
+change readiness timeouts or qualify a provider.
+
+The four-client lane passes against a disposable local RustFS backend with AWS
+CLI 2.34.24, rclone 1.75.0, mc RELEASE.2025-08-13 and restic 0.19.1. Both
+AWS and rclone return independently verified two-part ETags for the 9 MiB-plus-
+one-byte fixture. mc uses ordinary PUT at that size; restic backup and restore
+pass without a claim about its internal multipart layout. This lane uses an
+in-memory rollback anchor and does not qualify process restart or retention.
+
+Copy qualification uses the final `s3,k8s` release binary with rclone 1.75.0
+and AWS CLI 2.34.24. Direct rclone `moveto` passes for a 4 KiB packed object
+and an AWS-created 100 MiB multipart object on memory and RustFS. Each move
+uses `CopyObject` followed by `DeleteObject`, without payload download/upload
+fallback. ETag, SHA256 checksum/type, length and restored bytes remain exact
+after source deletion. RustFS provider traces record zero source-payload reads
+or writes during both moves; normal encrypted metadata publication still occurs.
+
+A fresh gateway process restores both copied destinations using the unchanged
+Kubernetes Lease anchor, with repository initialization disabled. This is a
+graceful process-restart check, not crash takeover or retained-provider
+qualification. Source-condition mismatch, cross-bucket copy and metadata
+`REPLACE` reject without creating destinations. COPY accepts the client's inert
+content/user metadata and default `STANDARD` storage class; these results do
+not qualify arbitrary metadata preservation or other copy extensions.
+
+`just fuzz-smoke` exercises commit headers/objects, canonical CBOR, both
+repository-envelope purposes, recovery bundles, index runs/roots, format roots,
+payload packs and detached single-part payloads. It copies raw seeds and frozen
+vectors to temporary corpora so fuzzing does not modify the fixtures. Defaults
+are 60 seconds per target and a 512 MiB per-target RSS ceiling; use
+`RS3_FUZZ_SMOKE_SECONDS` and `RS3_FUZZ_RSS_LIMIT_MB` for an explicit local override.
+
+Runtime replay, recovery-history traversal and adoption require strictly
+increasing parent-to-child publication timestamps. New recovery-history
+acceptance also checks freshness against sampled time and declared uncertainty.
+Signed timestamps are not a current-time oracle; codec and runtime checks do not
+replace retained-provider and complete recovery qualification.
+
+## September 9 history-efficiency qualification
+
+At `3e879cb`, the source-bound recovery fixture passes against disposable RustFS
+and Kind with a real Kubernetes Lease. It covers a 4 KiB packed value, a 100 MiB
+multipart value with part replacement, checkpoint/compaction after 256 churn
+writes, selected historical recovery, exact-version COMPLIANCE protection for
+the selected commit and observed restore sources, legal-hold enforcement on an
+unretained control, maintenance with reclamation disabled and no provider DELETE,
+AWS/rclone copy-out and range reads, and graceful readonly/writer restarts without
+changing the accepted anchor.
+
+The earlier standard `just preview-gate-v3-retained-local` attempt stopped at RustFS
+readiness because this host's Docker forwarded port timed out while the same
+health endpoint returned HTTP 200 inside the container. The recovery fixture
+therefore used host-network RustFS and a TLS relay into the temporary Kind API.
+Its first attempt failed when the relay's inherited 10-second socket timeout
+closed idle connections; the gateway stopped after Lease renewal exceeded its
+30-second duration. A copied fixture removed the relay's idle timeout while
+keeping connection and client request deadlines. The successful retry uses the
+same frozen server binary, records the helper hash and cleans all owned resources.
+The failed attempts remain in local evidence.
+
+A separate host-network run passes the direct retained-version storage contract
+and isolated GC rehearsal. It deletes one unprotected version, preserves one
+protected candidate and renews three exact dependencies under the explicitly
+unenforced guard of a disposable prefix. The rehearsal uses one-day GOVERNANCE
+retention; it does not test governance-bypass IAM.
+
+The [qualification receipt](assets/history-qualification-2026-09-09.json) records
+source/binary/result hashes, passed checks, failed attempts and scope boundaries.
+
+After host Docker connectivity was repaired, the complete standard
+`just preview-gate-v3-retained-local` passes at `25e0747`. It uses the normal
+Docker/Kind network path and covers six retained-storage contract tests, the
+isolated GC rehearsal, a fresh Helm gateway installation with 30-day COMPLIANCE
+retention, readiness, S3 smoke, AWS CLI/rclone/mc/restic round trips, and v03
+Lease-anchor verification. The temporary cluster is deleted after success. Source
+files remained unchanged during the run, and the receipt binds the gateway image
+and logs to that revision. The earlier Docker blocker is resolved.
+
+These are bounded local regression results. They do not qualify an external
+provider, governance-bypass IAM, crash takeover, lifecycle upgrades or an elapsed
+30-day retention interval. The separate
+[100,000-write comparison](reports/performance-2026-09-08.md#retained-history-efficiency-september-9-2026)
+uses a controlled in-memory provider and simulated time; its scale must not be
+attributed to this real-provider fixture.
+
 ## Important Lanes
 
 | Lane | Command | Scope |
 | --- | --- | --- |
 | Default | `just check` | Format, clippy, workspace tests. |
 | Preview local gate | `just preview-gate-local` | Default checks, S3-feature checks, and dependency policy checks. |
-| Storage S3 | `just integration-s3-local --mode container` | Storage contract against a disposable S3-compatible provider. |
+| Storage S3 | `just integration-s3-container` | Storage contract against a disposable S3-compatible provider; `just integration-s3-local --mode provided` runs it against an existing endpoint. |
 | Gateway S3 | `just integration-s3-gateway` | Gateway S3 operations through the repository path. |
-| Local v2 nightly gate | `just preview-gate-v2-nightly` | Scheduled or release-candidate gate: S3 feature checks plus v2 S3 tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes against disposable local backends. |
-| Live v2 preview gate | `just preview-gate-v2-live <bucket> <endpoint> <region>` | Consolidated retained-backend gate. Generates fresh sub-prefixes and runs v2 provider conformance, Gateway S3, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes. |
-| Live v2 provider conformance | `just check-v2-provider-v2-live <bucket> <endpoint> <region> <fresh-prefix>` | Runs `rs3 check-v2-provider` for the retained-version/Object Lock profile and emits JSON evidence for admin posture or release artifacts. |
-| Live v2 Gateway S3 | `just integration-s3-gateway-v2-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | v2-preview gateway smoke against an existing retained S3-compatible backend, including `mc`, default `rclone lsf`, and backend key privacy checks. |
+| Local v3 nightly gate | `just preview-gate-v3-nightly` | Scheduled or release-candidate gate: S3 feature checks plus v3 S3 tooling, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes against disposable local backends. |
+| Live v3 preview gate | `just preview-gate-v3-live <bucket> <endpoint> <region>` | Consolidated retained-backend gate. Generates fresh sub-prefixes and runs v3 provider conformance, Gateway S3, Kopia, Kubernetes Lease, Velero dynamic-PVC gateway-restart, and Velero/Postgres lanes. |
+| Live v3 provider conformance | `just check-provider-live <bucket> <endpoint> <region> <fresh-prefix>` | Runs `rs3 check-provider` for the retained-version/Object Lock profile and emits JSON evidence for admin posture or release artifacts. |
+| Live v3 Gateway S3 | `just integration-s3-gateway-v3-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | v3-preview gateway smoke against an existing retained S3-compatible backend, including `mc`, default `rclone lsf`, and backend key privacy checks. |
 | Kopia | `just integration-kopia-gateway` | Real Kopia create, snapshot, and restore through the gateway. |
-| Live v2 Kopia | `just integration-kopia-gateway-v2-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | Real Kopia create, snapshot, and restore through a v2-preview gateway against an existing retained backend. |
-| Kubernetes | `just integration-k8s-gateway` | Image build, kind cluster, Helm install, readiness, S3 smoke. |
-| Kubernetes v2 Lease | `just integration-k8s-gateway-v2` | v2-preview Helm deployment using a Kubernetes Lease anchor, with an assertion that v2 anchor annotations are written. |
+| Live v3 Kopia | `just integration-kopia-gateway-v3-live --backend-bucket <bucket> --endpoint-url <endpoint> --region <region> --backend-prefix <fresh-prefix>` | Real Kopia create, snapshot, and restore through a v3-preview gateway against an existing retained backend. |
+| Kubernetes Lease | `just integration-k8s-gateway` | Image build, kind cluster, Helm install, readiness and S3 smoke, including verification that v03 anchor annotations and repository format generation 3 are written. |
+| Kubernetes lifecycle | `just integration-k8s-gateway-lifecycle` | Generated-salt lifecycle test: restarts the gateway, repeats the same Helm command against the live writer without requalification, and upgrades to a rebuilt fixture that requalifies once, reading the earlier object back after every step. The upgrade uses a synthetic revision to invalidate evidence; it does not qualify a second real source revision or assert fail-fast retry ordering. |
 | Velero/Kopia | `just integration-velero-kopia-smoke` | Velero node-agent/Kopia backup and restore smoke. |
-| Live v2 Velero dynamic PVC | `just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia dynamic-PVC backup and restore through a v2-preview gateway after a gateway restart, against an existing retained backend. |
-| Live v2 Velero Postgres | `just integration-velero-kopia-postgres-v2-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia Postgres backup and restore through a v2-preview gateway against an existing retained backend. |
-| Preview release gate | `just preview-gate-release` | v2 Kopia gateway, Velero dynamic PVC gateway-restart in normal write mode, and Velero Postgres smoke. The restart lane rejects any gateway container restart during the forced rollout. |
+| Live v3 Velero dynamic PVC | `just integration-velero-kopia-dynamic-pvc-gateway-restart-v3-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia dynamic-PVC backup and restore through a v3-preview gateway after a gateway restart, against an existing retained backend. |
+| Live v3 Velero Postgres | `just integration-velero-kopia-postgres-v3-live --backend-bucket <bucket> --backend-endpoint-url <endpoint> --backend-region <region> --backend-prefix <fresh-prefix>` | Velero/Kopia Postgres backup and restore through a v3-preview gateway against an existing retained backend. |
+| Preview release gate | `just preview-gate-release` | v3 Kopia gateway, Velero dynamic PVC gateway-restart in normal write mode, and Velero Postgres smoke. The restart lane rejects any gateway container restart during the forced rollout. |
 | Velero strict restore-readonly | `just integration-velero-kopia-dynamic-pvc-restore-readonly-smoke` | Incident-restore behavior: restored bytes verify, Velero artifact writes are denied, and backend writes stay at zero during restore. |
 | Lightweight perf smoke | `just perf-s3-gateway --format jsonl` | Small gateway scenario metrics and amplification. |
-| Gateway perf smoke | `just perf-s3-gateway --objects 32 --object-size 262144 --reads 64 --range-len 4096 --commit-batch-items 8 --concurrency 8 --format jsonl` | Release-profile local gateway run for current v2 request cost, throughput, and amplification. |
+| Gateway perf smoke | `just perf-s3-gateway --objects 32 --object-size 262144 --reads 64 --range-len 4096 --commit-batch-items 8 --concurrency 8 --format jsonl` | Release-profile local gateway run for current v03 request cost, throughput, and amplification. |
 | Docker-free HTTP gateway perf | `cargo run -p xtask --features containers -- perf --backend gateway-memory --scenario full-read --object-size 268435456 --reads 3 --gateway-build-profile release --format jsonl` | Spawns a release gateway, drives its real S3 adapter, reports the child process rather than driver RSS, and retains exact generic-storage request/byte counters. `gateway-filesystem` is also available for non-multipart local lanes. Memory-backend RSS includes stored ciphertext. |
 | 10k object scale gate | `just perf-scale-10k` | Three release-binary committed-write runs. Every run publishes a final signed checkpoint, discards writer state, reloads through a new repository instance, checks exact list cardinality, reads the first, middle, and last payload, and enforces the 1.50x lifetime write gate, 30-second reload ceiling, 1.04x cold-read byte amplification, one backend request per sentinel read, and at most 255 recovered active index runs. Runs on every CI change. |
+| 10k automatic compaction gate | `just perf-scale-10k-compaction` | The same scale gates with 16-item batches, concurrency 16, and 1 KiB objects to amortize the extra per-commit overhead while retaining the 1.50x write limit. Every run must observe at least one accepted active-run count decrease before its final checkpoint. JSONL reports `observed_compactions`, a lower bound for arbitrary concurrency and a per-pass count for this one-run-per-wave lane. Runs next to the ordinary 10k PR gate. |
 | 100k object scale gate | `just perf-scale-100k` | Release-binary 4,096-item low-amplification bulk tier with the same final-checkpoint, recovery, cardinality, amplification, direct cold-read, and active-run-count checks. |
 | 270k bounded-compaction evidence | `just perf-scale-tier 270000` | Crosses the 256-run watermark with the 1,024-item bulk tier and applies the lifetime amplification, 180-second elapsed, 4 GiB peak-RSS, recovery, cold-read, and active-run gates. The final post-remediation sample completed in 11.655 s at 758,521,856 B peak RSS, 1.505740509x amplification, and 140 recovered runs. |
 | 1M object scale gate | `just perf-scale-1m` | Manual in-memory high-capacity tier with the same checks. Historical revision `8f99a8a` passed three wire-v6 4,096-record runs at 44.639-45.553 s, 1,680,826,368-1,681,162,240 B process peak RSS including the in-memory backend, 1.268292436x amplification, 245 recovered runs, and exact sentinel reads. |
@@ -71,8 +228,11 @@ the cold-read counters separately from recovery.
 These lightweight lanes qualify write amplification, bounded recovery, direct
 cold sentinel reads, sentinel correctness, and the recovered active-run budget.
 Automatic compaction performs bounded passes beginning at 256 active runs,
-each selecting at most the oldest 128 level-0 runs while preserving newer
-level-0 and prior level-1 shards. A missing guard or fully validated
+each selecting at most 256 active runs across levels 0 and 1.
+Each window is also capped at 131,072 mutations and 16 MiB of stored run
+sections; catalog-only selection favors more runs and lower rewrite cost.
+Accepted blinded-key generations identify obsolete upserts after source
+validation; winning tombstones and references outside the window remain. A missing guard or fully validated
 nonreducing bounded plan may defer and retry at later 64-run boundaries before
 pausing at 896. Configured-guard, corruption, storage, anchor, and other
 compaction errors poison immediately. The current 4,096-record
@@ -81,12 +241,23 @@ The earlier 1,024-record adversarial lane crossed six compaction windows and
 recovered 233 runs. Keep both lanes; one does not prove the other. Release
 timing still requires the documented pinned runner.
 
+`just test-churn-scale` runs 1,024 overwrite/delete/recreate cycles against an
+independent fixed-key model. Every cycle asserts one active run after
+compaction and fresh recovery, one replay commit, at most 32 compaction GETs,
+12 HEADs, 64 KiB read and 16 KiB written. Signed section spans prove zero
+payload reads or writes during compaction. Guarded exact-version GC reclaims
+obsolete objects while fresh current and protected historical roots still
+restore. A 64-cycle variant runs in `just check`. Planner regressions also cover
+full older shards that would otherwise block later churn, tombstone masking
+and invalid obsolete source facts. These deterministic memory-store checks do
+not qualify retained providers or production timing.
+
 The filesystem lane proves a fresh application process with empty rs3 caches;
 it does not claim a cold kernel page cache. Use a pinned local-disk mount rather
 than `/tmp`, preserve every generated run directory, and record any runner-level
 cache-control procedure separately.
 
-The current gateway no longer has a v1 repository runtime. Commands with `v2`
+The current gateway no longer has a v1 or v2 repository runtime. Commands with `v3`
 in their names keep their existing harness names, but they exercise the only
 supported repository format.
 
@@ -105,6 +276,23 @@ trial must choose and verify one storage safety profile:
   gateway verifies multipart postconditions immediately and fails closed when
   it cannot read the completed version.
 
+The shared memory, filesystem and live S3 contract checks string prefixes,
+complete inventory under raw-member page limits, and consistent range errors.
+The versioned tests also delete an unprotected current value above a protected
+older version, verify that the older exact version remains readable and cannot
+be deleted, and count delete markers when paging the inventory. Multipart tests
+check that duplicate or out-of-range internal parts fail without changing the
+accepted upload. These internal parts are distinct from client-facing S3
+multipart sessions. SDK request fixtures verify that empty or missing-part
+completion attempts abort the internal upload without publishing it, including
+when cleanup is denied. Cleanup remains best effort; these tests do not prove
+cleanup after process cancellation.
+
+SDK response fixtures cover missing or non-advancing pagination cursors,
+missing completion flags, delete-marker-only pages and exact full-read lengths.
+A successful container run is local provider evidence; repeat these tests on
+the configured provider before qualifying a deployment.
+
 `HEAD` before `PUT` is not the production fallback for create-only writes. It is
 non-atomic and only useful for a deliberately degraded compatibility mode, which
 is not part of the production-preview contract.
@@ -118,49 +306,33 @@ meaningful when the retention and exact-version checks run:
 just integration-s3-local --qualification-profile retained-version --object-lock
 ```
 
-For the consolidated v2 live preview gate, export provider credentials and use
-the positional gate command. The gate creates fresh sub-prefixes for the lanes
-it runs:
+For retained gateway qualification, use the guarded Kubernetes fixture:
 
 ```sh
-export AWS_ACCESS_KEY_ID=<access-key-id>
-export AWS_SECRET_ACCESS_KEY=<secret-access-key>
-export AWS_REGION=<region>
-export RS3_GOVERNANCE_BYPASS_REVIEWED=true
-just preview-gate-v2-live <bucket> <endpoint> <region>
+just preview-gate-v3-retained-local
 ```
 
-`RS3_GOVERNANCE_BYPASS_REVIEWED=true` is an operator assertion that normal
-gateway credentials cannot bypass governance retention after IAM or bucket
-policy review. The gate writes provider-conformance JSON under
-`.local/integration/`.
+This runs direct Object Lock/exact-version checks, then a 30-day COMPLIANCE
+repository with journaled initialization, a Kubernetes Lease, and AWS CLI,
+rclone, mc and restic round trips. It uses disposable local providers. It does
+not qualify an external provider or demonstrate an elapsed retention window.
 
-For governance mode, also review IAM or bucket policy so normal gateway
-credentials cannot bypass governance retention. The live retained-version test
-does not grant or use bypass headers, so it is not a substitute for that
-credential review.
+The legacy `preview-gate-v3-live`, `integration-s3-gateway-v3-live` and
+`integration-kopia-gateway-v3-live` recipes still include retained local
+memory-anchor launchers. Those launchers cannot meet the current recovery
+maintenance-guard requirement and are not current end-to-end qualification
+commands. For an external backend, qualify the provider and exercise backup
+and restore through a journaled Kubernetes deployment as described in
+[Production Preview](production-preview.md). External-provider qualification
+remains a separate requirement.
 
-After a provider passes qualification, run a real Kopia backup/restore through
-the gateway against the same backend. Use a fresh backend prefix for each live
-run, and enable repository retention when validating an Object Lock bucket:
+For governance mode, review IAM or bucket policy so normal gateway credentials
+cannot bypass governance retention. `RS3_GOVERNANCE_BYPASS_REVIEWED=true` records
+that operator assertion; the live Object Lock probe does not establish it.
 
-```sh
-RS3_REPOSITORY_RETENTION_MODE=governance \
-RS3_REPOSITORY_RETENTION_DAYS=1 \
-just integration-kopia-gateway --mode provided --backend-prefix <fresh-prefix>
-```
-
-For the Kubernetes path, run the Velero dynamic PVC gateway-restart lane against
-the same provider. This creates a disposable kind cluster, runs a Velero/Kopia
-backup, deletes the namespace, restarts the stateless gateway, restores the
-namespace, verifies that the replacement gateway container did not enter a
-startup restart loop, and verifies the restored file bytes:
-
-```sh
-RS3_REPOSITORY_RETENTION_MODE=governance \
-RS3_REPOSITORY_RETENTION_DAYS=1 \
-just integration-velero-kopia-dynamic-pvc-gateway-restart-v2-live --backend-prefix <fresh-prefix>
-```
+`integration k8s-gateway --keep-cluster` retains the kind cluster for log and
+resource inspection. Its disposable S3 backend is still removed, so the kept
+gateway is not usable for further requests.
 
 ## Privacy Tests
 

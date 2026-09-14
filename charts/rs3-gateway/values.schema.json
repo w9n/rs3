@@ -57,6 +57,65 @@
         }
       }
     },
+    "maintenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "reclamationEnabled",
+        "renewalHorizonSeconds",
+        "orphanPressureBytes",
+        "orphanPressureCount",
+        "orphanPressureMaxAgeSeconds",
+        "maxIntervalSeconds",
+        "minCooldownSeconds",
+        "pacingDelayMs",
+        "maxInventoryPages",
+        "maxInventoryItems",
+        "maxHistoryMetadataBytes",
+        "maxHistoryPendingBytes"
+      ],
+      "properties": {
+        "mode": { "type": "string", "enum": ["", "auto", "manual", "off"] },
+        "reclamationEnabled": { "type": "boolean" },
+        "renewalHorizonSeconds": { "type": ["integer", "null"], "minimum": 1 },
+        "orphanPressureBytes": { "type": ["integer", "null"], "minimum": 1 },
+        "orphanPressureCount": { "type": ["integer", "null"], "minimum": 1 },
+        "orphanPressureMaxAgeSeconds": { "type": ["integer", "null"], "minimum": 1 },
+        "maxIntervalSeconds": { "type": ["integer", "null"], "minimum": 1 },
+        "minCooldownSeconds": { "type": ["integer", "null"], "minimum": 1 },
+        "pacingDelayMs": { "type": ["integer", "null"], "minimum": 1 },
+        "maxInventoryPages": { "type": ["integer", "null"], "minimum": 1 },
+        "maxInventoryItems": { "type": ["integer", "null"], "minimum": 1 },
+        "maxHistoryMetadataBytes": {
+          "type": ["integer", "null"],
+          "minimum": 1048576,
+          "maximum": 8589934592
+        },
+        "maxHistoryPendingBytes": {
+          "type": ["integer", "null"],
+          "minimum": 25165824,
+          "maximum": 1073741824
+        }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publicKey",
+        "windowDays",
+        "renewalMarginSeconds",
+        "clockUncertaintyMs"
+      ],
+      "properties": {
+        "point": { "type": "string", "pattern": "^$|^(0|[1-9][0-9]{0,19})$" },
+        "publicKey": { "type": "string" },
+        "windowDays": { "type": "integer", "minimum": 1, "maximum": 36500 },
+        "renewalMarginSeconds": { "type": "integer", "minimum": 1, "maximum": 31536000 },
+        "clockUncertaintyMs": { "type": "integer", "minimum": 1, "maximum": 3600000 }
+      }
+    },
     "networkPolicy": {
       "type": "object",
       "additionalProperties": false,

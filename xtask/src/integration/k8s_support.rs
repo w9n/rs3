@@ -14,7 +14,7 @@ pub(crate) const CHART_NAME: &str = "rs3-gateway";
 pub(crate) const CHART_PATH: &str = "charts/rs3-gateway";
 pub(crate) const DEFAULT_PUBLIC_BUCKET: &str = "client-bucket";
 pub(crate) const GATEWAY_PORT: u16 = 9080;
-pub(crate) const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.json";
+pub(crate) const KEYRING_ENVELOPE_OBJECT_ID: &str = "keyrings/bootstrap-envelope.cbor";
 pub(crate) const KEYRING_WRAPPING_KEY_HEX: &str =
     "3333333333333333333333333333333333333333333333333333333333333333";
 pub(crate) const KEYRING_WRAPPING_KEY_ID: &str = "wrap-integration";
@@ -22,6 +22,9 @@ pub(crate) const REPOSITORY_ID: &str = "rs3-integration-repository";
 pub(crate) const REPOSITORY_SALT_HEX: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
 pub(crate) const SECRET_ACCESS_KEY: &str = "rs3-fixture-secret-key";
+// This caps diagnostic text attached to the original Helm error. Command::output
+// still buffers a command result before this display truncation is applied.
+const MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES: usize = 16 * 1024;
 
 pub(crate) struct GatewayChartValues<'a> {
     pub(crate) release_name: &'a str,
@@ -44,16 +47,74 @@ pub(crate) struct GatewayChartValues<'a> {
     pub(crate) retention_mode: Option<&'a str>,
     pub(crate) retention_days: Option<u32>,
     pub(crate) repository_id: &'a str,
-    pub(crate) repository_salt_hex: &'a str,
+    /// Pinned public salt, or `None` to let initialization generate one.
+    pub(crate) repository_salt_hex: Option<&'a str>,
     pub(crate) keyring_envelope_object_id: &'a str,
     pub(crate) keyring_wrapping_key_id: &'a str,
     pub(crate) keyring_wrapping_key_hex: &'a str,
     pub(crate) persistence_enabled: bool,
     pub(crate) wait_secs: u64,
+    /// Operator-asserted governance review inputs. The harness never
+    /// fabricates them; governance bootstrap without them fails before Helm.
+    pub(crate) governance_review: Option<&'a GovernanceReview>,
+}
+
+/// Reviewed governance-bypass inputs supplied by the operator environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GovernanceReview {
+    pub(crate) principal_fingerprint: String,
+}
+
+pub(crate) const GOVERNANCE_BYPASS_REVIEWED_ENV: &str = "RS3_GOVERNANCE_BYPASS_REVIEWED";
+pub(crate) const PROVIDER_PRINCIPAL_FINGERPRINT_ENV: &str = "RS3_PROVIDER_PRINCIPAL_FINGERPRINT";
+
+/// Reads governance review inputs from the environment when the requested
+/// retention mode needs them. Non-governance modes never read them.
+pub(crate) fn governance_review_from_env(
+    retention_mode: Option<&str>,
+) -> Result<Option<GovernanceReview>> {
+    governance_review_from_values(
+        retention_mode,
+        std::env::var(GOVERNANCE_BYPASS_REVIEWED_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(PROVIDER_PRINCIPAL_FINGERPRINT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn governance_review_from_values(
+    retention_mode: Option<&str>,
+    reviewed: Option<&str>,
+    fingerprint: Option<&str>,
+) -> Result<Option<GovernanceReview>> {
+    if retention_mode != Some("governance") {
+        return Ok(None);
+    }
+    if reviewed != Some("true") {
+        bail!(
+            "governance retention on a provided backend requires {GOVERNANCE_BYPASS_REVIEWED_ENV}=true after reviewing that gateway credentials cannot bypass governance retention; the harness does not assert this review"
+        );
+    }
+    let fingerprint = fingerprint.unwrap_or_default();
+    if fingerprint.len() != 64
+        || !fingerprint
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!(
+            "governance retention requires {PROVIDER_PRINCIPAL_FINGERPRINT_ENV} set to the lowercase SHA-256 fingerprint of the reviewed credential principal"
+        );
+    }
+    Ok(Some(GovernanceReview {
+        principal_fingerprint: fingerprint.to_owned(),
+    }))
 }
 
 pub(crate) fn helm_install_gateway(
     helm_bin: &str,
+    kubectl_bin: &str,
     kubeconfig_path: &Path,
     values: &GatewayChartValues<'_>,
 ) -> Result<()> {
@@ -64,6 +125,25 @@ pub(crate) fn helm_install_gateway(
     let payload_segment_size = values
         .payload_segment_size
         .map_or_else(|| "null".to_string(), |value| value.to_string());
+    let bootstrap = values.gateway_mode == "read-write"
+        && values.anchor_mode == "kubernetes-lease"
+        && (values.backend_endpoint == "s3"
+            || values.backend_endpoint.starts_with("http://")
+            || values.backend_endpoint.starts_with("https://"));
+    let allow_init = !bootstrap && values.gateway_mode != "restore-readonly";
+    if bootstrap
+        && values.retention_mode == Some("governance")
+        && values.governance_review.is_none()
+    {
+        bail!(
+            "automatic governance bootstrap requires reviewed operator inputs; set {GOVERNANCE_BYPASS_REVIEWED_ENV}=true and {PROVIDER_PRINCIPAL_FINGERPRINT_ENV}"
+        );
+    }
+    let governance_bypass_reviewed = values.governance_review.is_some();
+    let principal_fingerprint = values
+        .governance_review
+        .map(|review| review.principal_fingerprint.as_str())
+        .unwrap_or_default();
     run_command(
         helm_bin,
         &[
@@ -131,7 +211,9 @@ pub(crate) fn helm_install_gateway(
             "--set-string",
             &helm_set_string("logging.rustLog", values.rust_log),
             "--set",
-            "repository.allowInit=true",
+            &format!("bootstrap.enabled={bootstrap}"),
+            "--set",
+            &format!("repository.allowInit={allow_init}"),
             "--set",
             &format!("repository.payloadSegmentSizeBytes={payload_segment_size}"),
             "--set-string",
@@ -149,7 +231,10 @@ pub(crate) fn helm_install_gateway(
             "--set",
             "repositoryKeys.create=true",
             "--set-string",
-            &helm_set_string("repositoryKeys.saltHex", values.repository_salt_hex),
+            &helm_set_string(
+                "repositoryKeys.saltHex",
+                values.repository_salt_hex.unwrap_or_default(),
+            ),
             "--set-string",
             &helm_set_string(
                 "repositoryKeys.envelopeObjectId",
@@ -169,9 +254,144 @@ pub(crate) fn helm_install_gateway(
             &format!("anchor.allowMemory={}", values.anchor_mode == "memory"),
             "--set",
             &format!("persistence.enabled={}", values.persistence_enabled),
+            "--set",
+            &format!("bootstrap.governanceBypassReviewed={governance_bypass_reviewed}"),
+            "--set-string",
+            &helm_set_string(
+                "providerConformance.principalFingerprint",
+                principal_fingerprint,
+            ),
         ],
     )
-    .context("failed to install gateway Helm chart")
+    .map_err(|error| {
+        error.context(format!(
+            "failed to install gateway Helm chart; namespace diagnostics before cleanup:\n{}",
+            collect_namespace_failure_diagnostics(kubectl_bin, kubeconfig_path, values)
+        ))
+    })
+}
+
+fn collect_namespace_failure_diagnostics(
+    kubectl_bin: &str,
+    kubeconfig_path: &Path,
+    values: &GatewayChartValues<'_>,
+) -> String {
+    let kubeconfig = kubeconfig_path.to_string_lossy();
+    let selector = format!("app.kubernetes.io/instance={}", values.release_name);
+    let mut redactions = vec![
+        ADMIN_BEARER_TOKEN,
+        ACCESS_KEY_ID,
+        SECRET_ACCESS_KEY,
+        values.backend_endpoint,
+        values.backend_prefix,
+        values.repository_salt_hex.unwrap_or_default(),
+        values.keyring_wrapping_key_hex,
+        kubeconfig.as_ref(),
+    ];
+    if let Some(access_key_id) = values.backend_access_key_id {
+        redactions.push(access_key_id);
+    }
+    if let Some(secret_access_key) = values.backend_secret_access_key {
+        redactions.push(secret_access_key);
+    }
+
+    [
+        capture_namespace_command(
+            "gateway pod readiness",
+            kubectl_bin,
+            &[
+                "--kubeconfig",
+                kubeconfig.as_ref(),
+                "--request-timeout=10s",
+                "--namespace",
+                values.namespace,
+                "get",
+                "pods",
+                "--selector",
+                selector.as_str(),
+                "--output",
+                "wide",
+            ],
+            &redactions,
+        ),
+        capture_namespace_command(
+            "namespace events",
+            kubectl_bin,
+            &[
+                "--kubeconfig",
+                kubeconfig.as_ref(),
+                "--request-timeout=10s",
+                "--namespace",
+                values.namespace,
+                "get",
+                "events",
+                "--sort-by=.lastTimestamp",
+            ],
+            &redactions,
+        ),
+        capture_namespace_command(
+            "gateway container logs",
+            kubectl_bin,
+            &[
+                "--kubeconfig",
+                kubeconfig.as_ref(),
+                "--request-timeout=10s",
+                "--namespace",
+                values.namespace,
+                "logs",
+                "--selector",
+                selector.as_str(),
+                "--all-containers=true",
+                "--prefix=true",
+                "--tail=80",
+                "--max-log-requests=3",
+                "--pod-running-timeout=10s",
+            ],
+            &redactions,
+        ),
+    ]
+    .join("\n\n")
+}
+
+fn capture_namespace_command(
+    label: &str,
+    kubectl_bin: &str,
+    args: &[&str],
+    redactions: &[&str],
+) -> String {
+    match Command::new(kubectl_bin).args(args).output() {
+        Ok(output) => format!(
+            "{label} ({}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            truncated_redacted_diagnostic(&output.stdout, redactions),
+            truncated_redacted_diagnostic(&output.stderr, redactions),
+        ),
+        Err(error) => format!(
+            "{label}: failed to start kubectl: {}",
+            truncated_redacted_text(error.to_string(), redactions)
+        ),
+    }
+}
+
+fn truncated_redacted_diagnostic(bytes: &[u8], redactions: &[&str]) -> String {
+    truncated_redacted_text(String::from_utf8_lossy(bytes).into_owned(), redactions)
+}
+
+fn truncated_redacted_text(mut text: String, redactions: &[&str]) -> String {
+    for value in redactions {
+        if !value.is_empty() {
+            text = text.replace(value, "[REDACTED]");
+        }
+    }
+    if text.len() <= MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES {
+        return text;
+    }
+
+    let mut tail_start = text.len() - MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES;
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("[... {tail_start} bytes omitted]\n{}", &text[tail_start..])
 }
 
 pub(crate) fn helm_set_gateway_mode(
@@ -270,11 +490,11 @@ pub(crate) fn assert_v2_lease_anchor(
         .context("Lease anchor is missing annotations")?;
 
     for key in [
-        "rs3.rs/v2-commit-key",
-        "rs3.rs/v2-body-digest",
-        "rs3.rs/v2-signing-key-id",
-        "rs3.rs/v2-format-digest",
-        "rs3.rs/v2-format-object-id",
+        "rs3.rs/v3-commit-key",
+        "rs3.rs/v3-body-digest",
+        "rs3.rs/v3-signing-key-id",
+        "rs3.rs/v3-format-digest",
+        "rs3.rs/v3-format-object-id",
     ] {
         let Some(value) = annotations.get(key).and_then(serde_json::Value::as_str) else {
             bail!("Lease anchor is missing `{key}`");
@@ -284,11 +504,14 @@ pub(crate) fn assert_v2_lease_anchor(
         }
     }
 
-    let sequence = required_u64_annotation(annotations, "rs3.rs/v2-sequence")?;
+    if required_u64_annotation(annotations, "rs3.rs/repository-format-generation")? != 3 {
+        bail!("Lease anchor repository format generation must be 3");
+    }
+    let sequence = required_u64_annotation(annotations, "rs3.rs/v3-sequence")?;
     if sequence == 0 {
         bail!("Lease anchor v2 sequence must be greater than zero");
     }
-    let generation = required_u64_annotation(annotations, "rs3.rs/v2-format-generation")?;
+    let generation = required_u64_annotation(annotations, "rs3.rs/v3-format-generation")?;
     if generation == 0 {
         bail!("Lease anchor v2 format generation must be greater than zero");
     }
@@ -311,6 +534,104 @@ fn required_u64_annotation(
 
 fn helm_set_string(key: &str, value: &str) -> String {
     format!("{key}={}", value.replace('\\', "\\\\").replace(',', "\\,"))
+}
+
+/// Restarts the gateway Deployment and waits for the rollout to finish.
+pub(crate) fn kubectl_rollout_restart(
+    kubectl_bin: &str,
+    kubeconfig_path: &Path,
+    namespace: &str,
+    deployment: &str,
+    wait_secs: u64,
+) -> Result<()> {
+    let kubeconfig = path_str(kubeconfig_path)?;
+    let target = format!("deployment/{deployment}");
+    run_command(
+        kubectl_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "-n",
+            namespace,
+            "rollout",
+            "restart",
+            &target,
+        ],
+    )?;
+    let timeout = format!("--timeout={wait_secs}s");
+    run_command(
+        kubectl_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "-n",
+            namespace,
+            "rollout",
+            "status",
+            &target,
+            &timeout,
+        ],
+    )
+}
+
+/// Waits until every bootstrap Job in the namespace has completed.
+pub(crate) fn wait_for_bootstrap_jobs(
+    kubectl_bin: &str,
+    kubeconfig_path: &Path,
+    namespace: &str,
+    wait_secs: u64,
+) -> Result<()> {
+    let kubeconfig = path_str(kubeconfig_path)?;
+    let timeout = format!("--timeout={wait_secs}s");
+    run_command(
+        kubectl_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "-n",
+            namespace,
+            "wait",
+            "--for=condition=complete",
+            "job",
+            "--all",
+            &timeout,
+        ],
+    )
+    .context("bootstrap Job did not complete")
+}
+
+/// Reads the onboarding journal's durable probe reservation count.
+pub(crate) fn bootstrap_journal_attempts(
+    kubectl_bin: &str,
+    kubeconfig_path: &Path,
+    namespace: &str,
+    release_name: &str,
+) -> Result<u64> {
+    let kubeconfig = path_str(kubeconfig_path)?;
+    let mut journal = helm_fullname(release_name);
+    journal.truncate(53);
+    let journal = format!("{}-bootstrap", journal.trim_end_matches('-'));
+    let state = run_command_capture(
+        kubectl_bin,
+        &[
+            "--kubeconfig",
+            kubeconfig,
+            "-n",
+            namespace,
+            "get",
+            "secret",
+            &journal,
+            "-o",
+            "go-template={{index .data \"state\" | base64decode}}",
+        ],
+    )
+    .with_context(|| format!("failed to read bootstrap journal `{journal}`"))?;
+    let record: serde_json::Value =
+        serde_json::from_str(state.trim()).context("bootstrap journal state was not JSON")?;
+    record
+        .get("attempts")
+        .and_then(serde_json::Value::as_u64)
+        .context("bootstrap journal state has no attempts count")
 }
 
 pub(crate) fn helm_fullname(release_name: &str) -> String {
@@ -492,6 +813,11 @@ impl KindCluster {
         &self.name
     }
 
+    /// Docker network shared by kind control-plane and worker containers.
+    pub(crate) const fn docker_network(&self) -> &'static str {
+        "kind"
+    }
+
     /// Load a locally available image into the cluster.
     ///
     /// `kind load docker-image` exports a manifest list and imports it with
@@ -656,4 +982,78 @@ pub(crate) fn run_command_capture(program: &str, args: &[&str]) -> Result<String
     }
 
     String::from_utf8(output.stdout).context("command stdout was not valid UTF-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GovernanceReview, MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES, governance_review_from_values,
+        truncated_redacted_text,
+    };
+
+    #[test]
+    fn governance_review_requires_explicit_operator_inputs() {
+        let fingerprint = "a".repeat(64);
+        assert_eq!(
+            governance_review_from_values(Some("compliance"), None, None).expect("unused"),
+            None
+        );
+        assert_eq!(
+            governance_review_from_values(None, Some("true"), Some(&fingerprint)).expect("unused"),
+            None
+        );
+        let missing = governance_review_from_values(Some("governance"), None, Some(&fingerprint))
+            .expect_err("review flag required");
+        assert!(
+            missing
+                .to_string()
+                .contains("RS3_GOVERNANCE_BYPASS_REVIEWED=true")
+        );
+        let wrong =
+            governance_review_from_values(Some("governance"), Some("yes"), Some(&fingerprint))
+                .expect_err("only the literal true counts as review");
+        assert!(
+            wrong
+                .to_string()
+                .contains("RS3_GOVERNANCE_BYPASS_REVIEWED=true")
+        );
+        for bad in [
+            "",
+            "ABCDEF",
+            &"a".repeat(63),
+            &format!("{}G", "a".repeat(63)),
+        ] {
+            let error = governance_review_from_values(Some("governance"), Some("true"), Some(bad))
+                .expect_err("fingerprint must be 64 lowercase hex characters");
+            assert!(
+                error
+                    .to_string()
+                    .contains("RS3_PROVIDER_PRINCIPAL_FINGERPRINT")
+            );
+        }
+        assert_eq!(
+            governance_review_from_values(Some("governance"), Some("true"), Some(&fingerprint))
+                .expect("complete review"),
+            Some(GovernanceReview {
+                principal_fingerprint: fingerprint,
+            })
+        );
+    }
+
+    #[test]
+    fn namespace_diagnostics_redact_before_truncation() {
+        let secret = "fixture-secret";
+        let output = format!(
+            "{}{}",
+            "x".repeat(MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES),
+            secret
+        );
+
+        let diagnostic = truncated_redacted_text(output, &[secret]);
+
+        assert!(diagnostic.starts_with("[... "));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains(secret));
+        assert!(diagnostic.len() <= MAX_NAMESPACE_DIAGNOSTIC_OUTPUT_BYTES + 64);
+    }
 }

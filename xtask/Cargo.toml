@@ -20,7 +20,7 @@ containers = [
   "dep:testcontainers",
 ]
 k8s = [
-  "s3",
+  "containers",
   "dep:aws-sdk-s3",
   "dep:k8s-openapi",
   "dep:rs3-k8s",
@@ -61,7 +61,6 @@ testcontainers = { version = "0.27.3", features = [
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-zeroize.workspace = true
 
 [lints]
 workspace = true

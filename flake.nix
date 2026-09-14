@@ -25,6 +25,7 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
+            awscli2
             cargo
             cargo-audit
             cargo-deny
@@ -38,6 +39,7 @@
             kopia
             kubectl
             mdbook
+            minio-client
             openssl
             pkg-config
             python3Packages.mkdocs
@@ -45,6 +47,8 @@
             rust-analyzer
             rustc
             rustfmt
+            rclone
+            restic
             sccache
             taplo
             velero

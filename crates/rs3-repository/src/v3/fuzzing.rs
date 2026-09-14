@@ -1,0 +1,572 @@
+//! Fuzz-only adapters for backend-controlled v3 parser inputs.
+
+use crate::payload::{
+    SegmentedPayloadLayout, open_payload_object, seal_payload_object, segmented_ciphertext_span,
+    total_segmented_payload_len,
+};
+use crate::v3::index_root::{
+    decode_v3_index_root_plaintext_for_fuzzing, encode_v3_index_root_plaintext_for_fuzzing,
+};
+use crate::v3::{
+    V3_SECTION_FLAG_MUST_UNDERSTAND, V3Algorithms, V3CommitHeader, V3CommitKey, V3CommitKind,
+    V3CommitParentRef, V3CommitSelfRef, V3EmbeddedIndexRunLocation, V3FormatError, V3FormatRef,
+    V3IndexRoot, V3IndexRootRunRef, V3KeyringEnvelopeRef, V3PayloadPackFacts, V3PayloadPackId,
+    V3PayloadPackRecordContext, V3PayloadPackRecordInput, V3PayloadPackRecordRef, V3Result,
+    V3SectionDescriptor, V3SectionType, body_digest_for_v3_sections, digest_v3_section,
+    open_v3_index_root, open_v3_payload_pack_record, parse_v3_commit_header,
+    parse_v3_commit_object, plan_v3_payload_pack_record_range, seal_v3_index_root,
+    seal_v3_payload_pack, validate_v3_payload_pack_record_ref,
+};
+use bytes::Bytes;
+use rs3_crypto::{KeyMaterial, KeyRing, SecretBytes};
+use rs3_index::PayloadLayout;
+use rs3_index::run::{
+    IndexBlindKey, IndexMutation, IndexPayloadPointer, IndexRun, IndexRunKeyringRef,
+    IndexRunLimits, IndexRunStandaloneStreamContainer, IndexTombstone, IndexUpsert,
+    decode_index_run, encode_index_run,
+};
+use rs3_storage::ByteRange;
+use rs3_types::{
+    BackendObjectId, BackendVersionId, KeyDescriptor, KeyId, KeyPurpose, KeyStatus, LogicalPath,
+    Sequence,
+};
+
+const MAX_FUZZ_INPUT_LEN: usize = 1024 * 1024;
+const MAX_STRUCTURED_PAYLOAD_LEN: usize = 64 * 1024;
+
+/// Parses a candidate v3 commit header and round-trips successful decodes.
+pub fn parse_v03_commit_header_bytes(input: &[u8]) {
+    if input.len() > MAX_FUZZ_INPUT_LEN {
+        return;
+    }
+
+    let keyring = signing_keyring();
+    let object_id = commit_object_id();
+    let Ok(parsed) = parse_v3_commit_header(&object_id, input, &keyring) else {
+        return;
+    };
+
+    let encoded = parsed
+        .header
+        .encode_header_span()
+        .unwrap_or_else(|error| panic!("parsed v03 commit header failed to re-encode: {error}"));
+    let reparsed = parse_v3_commit_header(&object_id, &encoded, &keyring)
+        .unwrap_or_else(|error| panic!("re-encoded v03 commit header failed to parse: {error}"));
+
+    assert_eq!(reparsed.header, parsed.header);
+    assert_eq!(reparsed.header_len, parsed.header_len);
+    assert_eq!(reparsed.sections_start, parsed.sections_start);
+}
+
+/// Parses a candidate v3 commit object and round-trips successful decodes.
+pub fn parse_v03_commit_object_bytes(input: &[u8]) {
+    if input.len() > MAX_FUZZ_INPUT_LEN {
+        return;
+    }
+
+    let keyring = signing_keyring();
+    let object_id = commit_object_id();
+    let Ok(parsed) = parse_v3_commit_object(&object_id, Bytes::copy_from_slice(input), &keyring)
+    else {
+        return;
+    };
+
+    let section_region = &parsed.body[parsed.parsed_header.sections_start..];
+    let encoded = parsed
+        .parsed_header
+        .header
+        .encode_object(section_region)
+        .unwrap_or_else(|error| panic!("parsed v03 commit object failed to re-encode: {error}"));
+
+    assert_eq!(encoded, parsed.body);
+}
+
+/// Builds a bounded signed commit from fuzz bytes and exercises the reachable parser path.
+pub fn round_trip_v03_commit_structure(input: &[u8]) {
+    if input.len() > MAX_FUZZ_INPUT_LEN {
+        return;
+    }
+    let selector = input.first().copied().unwrap_or(0);
+    let fallback_section_region = [0_u8; 2];
+    let section_region = input
+        .get(1..)
+        .filter(|region| region.len() >= fallback_section_region.len())
+        .unwrap_or(&fallback_section_region);
+    let kind = if selector & 1 == 0 {
+        V3CommitKind::Root
+    } else {
+        V3CommitKind::Delta
+    };
+    let commit_key = if kind == V3CommitKind::Root {
+        V3CommitKey::from_parts(Sequence::new(1), [0x42; 32])
+            .unwrap_or_else(|error| panic!("{error}"))
+    } else {
+        commit_object_key()
+    };
+    let parent_key = V3CommitKey::from_parts(Sequence::new(41), [0x41; 32])
+        .unwrap_or_else(|error| panic!("{error}"));
+    let sections = if kind == V3CommitKind::Root {
+        vec![V3SectionDescriptor {
+            section_type: V3SectionType::IndexRoot,
+            offset: 0,
+            length: section_region.len() as u64,
+            flags: V3_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: digest_v3_section(section_region),
+        }]
+    } else if selector & 4 == 0 {
+        let payload_len = section_region.len() / 2;
+        vec![
+            V3SectionDescriptor {
+                section_type: V3SectionType::PayloadPack,
+                offset: 0,
+                length: payload_len as u64,
+                flags: V3_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v3_section(&section_region[..payload_len]),
+            },
+            V3SectionDescriptor {
+                section_type: V3SectionType::IndexRun,
+                offset: payload_len as u64,
+                length: (section_region.len() - payload_len) as u64,
+                flags: V3_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v3_section(&section_region[payload_len..]),
+            },
+        ]
+    } else if selector & 8 == 0 {
+        vec![V3SectionDescriptor {
+            section_type: V3SectionType::IndexRun,
+            offset: 0,
+            length: section_region.len() as u64,
+            flags: V3_SECTION_FLAG_MUST_UNDERSTAND,
+            digest: digest_v3_section(section_region),
+        }]
+    } else {
+        let payload_len = section_region.len() / 2;
+        vec![
+            V3SectionDescriptor {
+                section_type: V3SectionType::PayloadPack,
+                offset: 0,
+                length: payload_len as u64,
+                flags: V3_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v3_section(&section_region[..payload_len]),
+            },
+            V3SectionDescriptor {
+                section_type: V3SectionType::IndexRun,
+                offset: payload_len as u64,
+                length: (section_region.len() - payload_len) as u64,
+                flags: V3_SECTION_FLAG_MUST_UNDERSTAND,
+                digest: digest_v3_section(&section_region[payload_len..]),
+            },
+        ]
+    };
+    let body_digest = body_digest_for_v3_sections(&sections, section_region)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let keyring = signing_keyring();
+    let header = V3CommitHeader {
+        self_ref: V3CommitSelfRef {
+            sequence: commit_key.sequence,
+            commit_key: commit_key.object_id.clone(),
+        },
+        parent: (kind == V3CommitKind::Delta).then_some(V3CommitParentRef {
+            sequence: parent_key.sequence,
+            commit_key: parent_key.object_id,
+            body_digest: [0x41; 32],
+            version_id: None,
+        }),
+        publish_time_ms: 0,
+        kind,
+        algorithms: V3Algorithms::v03(),
+        keyring_envelope_ref: V3KeyringEnvelopeRef {
+            object_id: object_id("keyrings/fuzz"),
+            digest: [0x24; 32],
+        },
+        section_index: sections,
+        body_digest,
+        signature: [0; 64],
+        signing_key_id: key_id("signing"),
+    }
+    .sign_with_keyring(&keyring)
+    .unwrap_or_else(|error| panic!("{error}"));
+    let encoded = header
+        .encode_object(section_region)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let parsed = parse_v3_commit_object(&commit_key.object_id, encoded.clone(), &keyring)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(parsed.body, encoded);
+    assert_eq!(parsed.parsed_header.header, header);
+}
+
+/// Decodes one canonical CBOR value with the same primitive reader used by commits.
+pub fn decode_canonical_cbor(input: &[u8]) -> V3Result<()> {
+    super::cbor::fuzz_decode_one(input).map_err(|_| V3FormatError::MalformedCbor)
+}
+
+/// Exercises the current v6 plaintext index-run parser with raw and near-valid inputs.
+pub fn decode_v03_index_run(input: &[u8]) {
+    if input.len() > MAX_FUZZ_INPUT_LEN {
+        return;
+    }
+
+    let limits = IndexRunLimits::default();
+    let _ = decode_index_run(input, &limits);
+
+    let run = standalone_index_run_fixture();
+    let encoded = encode_index_run(&run, &limits)
+        .unwrap_or_else(|error| panic!("v6 index-run fixture failed to encode: {error}"));
+    let decoded = decode_index_run(&encoded, &limits)
+        .unwrap_or_else(|error| panic!("encoded v6 index run failed to decode: {error}"));
+    assert_eq!(decoded, run);
+    exercise_near_valid_bytes(input, &encoded, |candidate| {
+        let _ = decode_index_run(candidate, &limits);
+    });
+}
+
+/// Exercises the authenticated index-root envelope and its current canonical decoder.
+pub fn open_v03_index_root_object(input: &[u8]) {
+    if input.len() > MAX_FUZZ_INPUT_LEN {
+        return;
+    }
+
+    let _ = decode_v3_index_root_plaintext_for_fuzzing(input);
+
+    let keyring = signing_keyring();
+    let containing_object = object_id("commits/v03/fuzz-index-root");
+    let _ = open_v3_index_root(&keyring, b"fuzz-repository", &containing_object, 3, input);
+
+    let root = index_root_fixture();
+    let plaintext = encode_v3_index_root_plaintext_for_fuzzing(&root)
+        .unwrap_or_else(|error| panic!("index-root fixture failed to encode: {error}"));
+    decode_v3_index_root_plaintext_for_fuzzing(&plaintext)
+        .unwrap_or_else(|error| panic!("encoded index-root fixture failed to decode: {error}"));
+    exercise_near_valid_bytes(input, &plaintext, |candidate| {
+        let _ = decode_v3_index_root_plaintext_for_fuzzing(candidate);
+    });
+    let sealed = seal_v3_index_root(&keyring, b"fuzz-repository", &containing_object, 3, &root)
+        .unwrap_or_else(|error| panic!("index-root fixture failed to seal: {error}"));
+    let opened = open_v3_index_root(
+        &keyring,
+        b"fuzz-repository",
+        &containing_object,
+        3,
+        sealed.bytes(),
+    )
+    .unwrap_or_else(|error| panic!("sealed index-root fixture failed to open: {error}"));
+    assert_eq!(opened, root);
+    exercise_near_valid_bytes(input, sealed.bytes(), |candidate| {
+        let _ = open_v3_index_root(
+            &keyring,
+            b"fuzz-repository",
+            &containing_object,
+            3,
+            candidate,
+        );
+    });
+}
+
+/// Exercises payload-pack fact validation, exact range planning, and segment AEAD opening.
+pub fn open_v03_payload_pack(input: &[u8]) {
+    if input.len() > MAX_FUZZ_INPUT_LEN {
+        return;
+    }
+
+    exercise_raw_payload_pack_facts(input);
+    if input.is_empty() {
+        return;
+    }
+
+    let keyring = signing_keyring();
+    let containing_object = object_id("commits/v03/fuzz-payload-pack");
+    let plaintext = input.get(..MAX_STRUCTURED_PAYLOAD_LEN).unwrap_or(input);
+    let records = [V3PayloadPackRecordInput {
+        plaintext: Bytes::copy_from_slice(plaintext),
+    }];
+    let sealed = seal_v3_payload_pack(
+        &keyring,
+        b"fuzz-repository",
+        &containing_object,
+        2,
+        &records,
+    )
+    .unwrap_or_else(|error| panic!("payload-pack fixture failed to seal: {error}"));
+    let record = sealed
+        .layout()
+        .record(0)
+        .unwrap_or_else(|| panic!("sealed payload pack omitted its only record"));
+    let context = V3PayloadPackRecordContext::new(
+        b"fuzz-repository",
+        &containing_object,
+        2,
+        sealed.layout().facts(),
+        record.reference(),
+        record.plaintext_len(),
+    )
+    .unwrap_or_else(|error| panic!("payload-pack fixture context was invalid: {error}"));
+    let opened = open_v3_payload_pack_record(&keyring, &context, sealed.bytes())
+        .unwrap_or_else(|error| panic!("sealed payload-pack fixture failed to open: {error}"));
+    assert_eq!(opened.as_ref(), plaintext);
+    exercise_near_valid_bytes(input, sealed.bytes(), |candidate| {
+        let _ = open_v3_payload_pack_record(&keyring, &context, candidate);
+    });
+}
+
+/// Exercises authenticated standalone layout bounds, spans and ciphertext tampering.
+pub fn open_v03_standalone_single(input: &[u8]) {
+    if input.is_empty() || input.len() > MAX_FUZZ_INPUT_LEN {
+        return;
+    }
+    let object = object_id("objects/v03/fuzz-standalone");
+    let keyring = signing_keyring();
+    let plaintext = input.get(..MAX_STRUCTURED_PAYLOAD_LEN).unwrap_or(input);
+    let chunk_size = usize::from(input[0]) + 1;
+    let (sealed, layout) = seal_payload_object(
+        &keyring,
+        &object,
+        plaintext,
+        chunk_size,
+        b"fuzz-context".to_vec(),
+        [4; 32],
+    )
+    .unwrap_or_else(|error| panic!("payload fixture: {error}"));
+    assert_eq!(
+        open_payload_object(&keyring, &object, &layout, sealed.clone(), ByteRange::Full)
+            .unwrap_or_else(|error| panic!("payload open: {error}"))
+            .as_ref(),
+        plaintext
+    );
+    exercise_near_valid_bytes(input, &sealed, |candidate| {
+        let _ = open_payload_object(
+            &keyring,
+            &object,
+            &layout,
+            Bytes::copy_from_slice(candidate),
+            ByteRange::Full,
+        );
+    });
+    let mut reference = layout.reference().clone();
+    reference.chunk_size = fuzz_u64(input).unwrap_or(0);
+    reference.plaintext_len = fuzz_u64(input.get(8..).unwrap_or(input)).unwrap_or(u64::MAX);
+    if let Ok(candidate) = SegmentedPayloadLayout::new(reference, b"fuzz-context".to_vec()) {
+        let _ = total_segmented_payload_len(&candidate);
+        let _ = segmented_ciphertext_span(&candidate, ByteRange::Full);
+    }
+}
+
+fn standalone_index_run_fixture() -> IndexRun {
+    let header = payload_layout();
+    let stored_len = header.plaintext_len + header.plaintext_len.div_ceil(header.chunk_size) * 16;
+    IndexRun {
+        completion_receipt: None,
+        sequence: Sequence::new(7),
+        self_pack: None,
+
+        containers: Vec::new(),
+
+        standalone_stream_containers: vec![IndexRunStandaloneStreamContainer {
+            object_id: object_id("objects/v03/fuzz-standalone"),
+            version_id: Some(version_id("fuzz-version")),
+            stored_len,
+            object_digest: [0x51; 32],
+            keyring_envelope: IndexRunKeyringRef {
+                object_id: object_id("keyrings/fuzz"),
+                digest: [0x52; 32],
+            },
+            payload_layout: header.clone(),
+        }],
+        mutations: vec![
+            IndexMutation::Upsert(IndexUpsert {
+                etag: rs3_types::ObjectEtag::single(rs3_crypto::md5(b"fixture")),
+                checksum: None,
+                mutation_ordinal: 0,
+                blind_key: IndexBlindKey::from_bytes([0x31; 32]),
+                namespace_key_id: key_id("namespace"),
+                path: logical_path("private/fuzz-object"),
+                generation: Sequence::new(6),
+                payload: IndexPayloadPointer::ExternalStandaloneStream {
+                    container_ordinal: 0,
+                },
+                content_len: header.plaintext_len,
+                modified_at_ms: -1,
+                retention: None,
+                legal_hold: None,
+            }),
+            IndexMutation::Tombstone(IndexTombstone {
+                mutation_ordinal: 1,
+                blind_key: IndexBlindKey::from_bytes([0x32; 32]),
+                namespace_key_id: key_id("namespace"),
+                path: logical_path("private/deleted"),
+                generation: Sequence::new(7),
+            }),
+        ],
+    }
+}
+
+fn index_root_fixture() -> V3IndexRoot {
+    let keyring_ref = V3KeyringEnvelopeRef {
+        object_id: object_id("keyrings/fuzz"),
+        digest: [0x61; 32],
+    };
+    let run = V3IndexRootRunRef {
+        run_id: [0x62; 32],
+        run_sequence: Sequence::new(7),
+        minimum_generation: Sequence::new(6),
+        maximum_generation: Sequence::new(7),
+        mutation_count: 2,
+        frame_count: 3,
+        level: 0,
+        compaction_generation: 0,
+        namespace_bounds: (
+            IndexBlindKey::from_bytes([0x31; 32]),
+            IndexBlindKey::from_bytes([0x32; 32]),
+        ),
+        listing_bounds: (
+            logical_path("private/deleted"),
+            logical_path("private/fuzz-object"),
+        ),
+        keyring_envelope_ref: keyring_ref.clone(),
+        location: V3EmbeddedIndexRunLocation {
+            commit_key: object_id("commits/v03/fuzz-run"),
+            version_id: Some(version_id("fuzz-version")),
+            commit_stored_len: 16_384,
+            commit_body_digest: [0x63; 32],
+            sections_start: 1_024,
+            section_ordinal: 1,
+            section_offset: 4_096,
+            section_len: 4_096,
+            section_digest: [0x64; 32],
+        },
+    };
+    V3IndexRoot::new(
+        Sequence::new(7),
+        1,
+        V3FormatRef {
+            generation: 1,
+            digest: hex::encode([0x65; 32]),
+            object_id: object_id("format/fuzz"),
+            version_id: Some(version_id("fuzz-format-version")),
+        },
+        keyring_ref,
+        vec![run],
+    )
+    .unwrap_or_else(|error| panic!("index-root fixture was invalid: {error}"))
+}
+
+fn payload_layout() -> PayloadLayout {
+    PayloadLayout {
+        chunk_size: 512,
+        plaintext_len: 1_025,
+        key_id: key_id("content"),
+        carrier_id: [0x41; 32],
+        parts: vec![rs3_index::PayloadPart {
+            part_number: 1,
+            attempt_id: rs3_types::PayloadAttemptId::from_bytes([0x81; 32]),
+            plaintext_len: 1_025,
+        }],
+    }
+}
+
+fn exercise_raw_payload_pack_facts(input: &[u8]) {
+    let mut pack_id = [0_u8; 32];
+    let copied = input.len().min(pack_id.len());
+    pack_id[..copied].copy_from_slice(&input[..copied]);
+    let stored_len = fuzz_u32(input.get(32..).unwrap_or_default()).unwrap_or(0);
+    let record_count = fuzz_u32(input.get(36..).unwrap_or_default()).unwrap_or(0);
+    let Ok(facts) = V3PayloadPackFacts::new(
+        V3PayloadPackId::from_bytes(pack_id),
+        rs3_types::PayloadAttemptId::from_bytes([0xa3; 32]),
+        key_id("content"),
+        stored_len,
+        record_count,
+    ) else {
+        return;
+    };
+    let record = V3PayloadPackRecordRef::new(
+        fuzz_u32(input.get(40..).unwrap_or_default()).unwrap_or(0),
+        fuzz_u32(input.get(44..).unwrap_or_default()).unwrap_or(0),
+    );
+    let plaintext_len = fuzz_u64(input.get(48..).unwrap_or_default()).unwrap_or(0);
+    let _ = validate_v3_payload_pack_record_ref(&facts, &record, plaintext_len);
+    let end = fuzz_u64(input.get(56..).unwrap_or_default()).unwrap_or(0);
+    let _ = plan_v3_payload_pack_record_range(&facts, &record, plaintext_len, 0..end);
+}
+
+fn exercise_near_valid_bytes(input: &[u8], valid: &[u8], mut exercise: impl FnMut(&[u8])) {
+    if valid.is_empty() {
+        return;
+    }
+    let selector = fuzz_u64(input).unwrap_or(0);
+    let index = usize::try_from(selector % valid.len() as u64).unwrap_or(0);
+    let mut mutated = valid.to_vec();
+    mutated[index] ^= input.get(8).copied().unwrap_or(1).max(1);
+    exercise(&mutated);
+
+    let truncation = usize::try_from(selector % (valid.len() as u64 + 1)).unwrap_or(0);
+    exercise(&valid[..truncation]);
+}
+
+fn fuzz_u32(input: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(input.get(..4)?.try_into().ok()?))
+}
+
+fn fuzz_u64(input: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(input.get(..8)?.try_into().ok()?))
+}
+
+fn commit_object_id() -> BackendObjectId {
+    commit_object_key().object_id
+}
+
+fn commit_object_key() -> V3CommitKey {
+    V3CommitKey::from_parts(Sequence::new(42), [0x42; 32]).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn object_id(value: &str) -> BackendObjectId {
+    BackendObjectId::new(value).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn version_id(value: &str) -> BackendVersionId {
+    BackendVersionId::new(value).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn logical_path(value: &str) -> LogicalPath {
+    LogicalPath::new(value).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn key_id(value: &str) -> KeyId {
+    KeyId::new(value).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn secret_with_byte(byte: u8) -> SecretBytes {
+    SecretBytes::new(vec![byte; SecretBytes::MIN_LEN]).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn key_material(
+    value: &str,
+    purpose: KeyPurpose,
+    status: KeyStatus,
+    secret_byte: u8,
+) -> KeyMaterial {
+    KeyMaterial::new(
+        KeyDescriptor {
+            id: key_id(value),
+            purpose,
+            status,
+            created_at_ms: 0,
+            public_key: None,
+        },
+        secret_with_byte(secret_byte),
+    )
+}
+
+fn signing_keyring() -> KeyRing {
+    KeyRing::new(vec![
+        key_material("namespace", KeyPurpose::Namespace, KeyStatus::Primary, 1),
+        key_material("metadata", KeyPurpose::Metadata, KeyStatus::Primary, 2),
+        key_material(
+            "signing",
+            KeyPurpose::CheckpointSigning,
+            KeyStatus::Primary,
+            3,
+        ),
+        key_material("content", KeyPurpose::Content, KeyStatus::Primary, 4),
+    ])
+    .unwrap_or_else(|error| panic!("{error}"))
+}

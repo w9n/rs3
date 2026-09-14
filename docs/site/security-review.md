@@ -45,7 +45,7 @@ durable bytes and observable names.
 | --- | --- |
 | Default checks pass | `just check` |
 | Docs build | `just docs-check` inside Nix |
-| S3 storage contract | `just integration-s3-local --mode container` |
+| S3 storage contract | `just integration-s3-container` |
 | Gateway S3 path | `just integration-s3-gateway` |
 | Kopia restore | `just integration-kopia-gateway` |
 | Larger restore baseline | `kopia-measured-matrix --profile-set larger-restores --runs 3 --gateway-build-profile release` |
@@ -58,6 +58,6 @@ Stop the review if a change:
 - adds plaintext names to backend keys, telemetry, tags, or errors
 - treats Object Lock as the only latest-state authority
 - falls back from external anchor to memory
-- retires keys without retained v2 commit-chain analysis
+- retires keys without retained v03 commit-chain analysis
 - optimizes reads through path-indexed backend objects
 - adds provider behavior without a capability test or documented contract

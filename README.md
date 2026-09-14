@@ -3,26 +3,26 @@
 `rs3` is an experimental Rust workspace for a path-private, tamper-evident,
 S3-compatible backup gateway for Kubernetes operators.
 
+For the operator path, start with [Deploy, Back Up, and Restore](docs/site/deploy-backup-restore.md): configure once, let Helm initialize the repository, then use the same gateway for backups and ordinary restores.
+
 ## Status
 
 The project has a working local S3-compatible gateway path, repository
-encryption boundaries, signed v2 commit/anchor plumbing, integration harnesses,
+encryption boundaries, signed v03 commits and anchors, integration harnesses,
 Kubernetes Lease anchoring, restore-bundle workflows, production posture checks,
 and Kopia-focused performance measurement. The current release target is a
 production preview: suitable for controlled evaluation, not yet a stable
 repository-format or security guarantee. New preview repositories use the
-`v2-preview` repository format; it is the only format accepted by the current
+`v3-preview` repository format; it is the only format accepted by the current
 gateway.
 
-Large known-length and chunked uploads use the same catalogued state model as
-bounded batches. Unknown-length and zero-length streamed commits use the signed
-section shape `[PAYLOAD, INDEX_RUN]`. Large known-length requests instead upload
-one opaque standalone payload carrier before publishing a short `[INDEX_RUN]`
-commit containing its encrypted exact reference. Checkpoints, recovery,
-compaction, and garbage collection retain either historical payload carrier
-without copying its ciphertext. Zero-length streamed requests remain
-authenticated stream carriers rather than being rewritten into a different wire
-shape.
+Bounded nonempty writes publish a ciphertext-only `PAYLOAD_PACK` with an
+`INDEX_RUN`. Large or unknown-length nonempty streams upload one opaque detached
+payload, verify its complete stored ciphertext, then publish a short
+`[INDEX_RUN]` commit containing the encrypted exact reference. Empty values are
+index-only. Checkpoints, recovery, compaction and garbage collection preserve
+exact payload references without copying ciphertext. Success requires accepted,
+anchored publication; an uploaded payload alone is not visible repository state.
 
 Current engineering priorities:
 
@@ -38,6 +38,11 @@ Current engineering priorities:
 See `docs/site/production-preview.md` for the preview contract and release
 gates, and `docs/site/release-process.md` for the artifact and publication
 checklist.
+
+The separate `rs3-console` crate is experimental operator tooling outside the
+production-preview gateway deployment contract. The gateway image and
+`rs3-gateway` Helm chart do not include or deploy it; run it separately for
+local or controlled inspection.
 
 ## Development
 
@@ -93,8 +98,10 @@ The `rs3-server/s3` feature enables the server runtime to use the S3-compatible
 storage adapter. Set `RS3_BACKEND_ENDPOINT=s3` for the default AWS endpoint, or
 use an `http://` / `https://` endpoint URL for an S3-compatible service. For the
 production-preview shape, configure an encrypted keyring envelope with
-`RS3_KEYRING_WRAPPING_KEY_HEX`, `RS3_REPOSITORY_ID`, and a stable public
-`RS3_REPOSITORY_SALT_HEX`. The wrapping key must be high-entropy key material;
+`RS3_KEYRING_WRAPPING_KEY_HEX` and `RS3_REPOSITORY_ID`; the public salt is
+generated at initialization and recovered from the verified envelope, with
+`RS3_REPOSITORY_SALT_HEX` only pinning a known value. The wrapping key must be
+high-entropy key material;
 derive human passphrases outside `rs3`. `RS3_KEYRING_WRAPPING_KEY_ID` defaults
 to `wrap-v1`; `RS3_KEYRING_ENVELOPE_OBJECT_ID` is only a bootstrap or recovery
 override.
@@ -110,14 +117,16 @@ tradeoff is useful.
 
 ## Workspace Layout
 
-- `crates/rs3-console`: read-only single-gateway operations console.
+- `crates/rs3-console`: experimental, read-only single-gateway operations
+  console. It is outside the gateway image, Helm chart, and production-preview
+  deployment contract.
 - `crates/rs3-types`: shared strongly typed identifiers and policy types.
 - `crates/rs3-crypto`: cryptographic primitives, envelopes, and key derivation
   boundaries.
 - `crates/rs3-index`: append-friendly index and repository state model.
 - `crates/rs3-storage`: object-store abstraction.
 - `crates/rs3-k8s`: Kubernetes anchor integration surface.
-- `crates/rs3-repository`: repository write, read, v2 anchor contracts, commit,
+- `crates/rs3-repository`: repository write, read, anchor contracts, commit,
   and maintenance behavior.
 - `crates/rs3-server`: command-line gateway process and S3 compatibility layer.
 - `xtask`: local automation used by `just`.

@@ -1,10 +1,57 @@
 //! Shared strongly typed identifiers and policy types.
 
+pub mod cbor;
+mod checksum;
+mod etag;
+
+pub use checksum::{ChecksumAlgorithm, ChecksumError, ChecksumType, ObjectChecksum};
+pub use etag::{Md5Digest, ObjectEtag, ObjectEtagError};
+
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
+
+/// Authentication tag bytes in the XChaCha20-Poly1305 payload wire formats.
+pub const PAYLOAD_AEAD_TAG_LEN: usize = 16;
+/// Plaintext bytes per independently authenticated v03 payload-pack segment.
+pub const PAYLOAD_PACK_SEGMENT_BYTES: usize = 64 * 1024;
+/// Bytes in the complete XChaCha20 nonce used for payload encryption.
+pub const PAYLOAD_NONCE_LEN: usize = 24;
+
+/// Opaque identity for one client multipart upload, unrelated to a logical path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MultipartUploadId([u8; 32]);
+
+impl MultipartUploadId {
+    /// Reconstructs an ID from bounded decoded client input or authenticated state.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    /// Returns the fixed-width opaque identity.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Fresh identity for one immutable payload sealing attempt.
+///
+/// Reusing an identity is permitted only when retrying already sealed bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PayloadAttemptId([u8; 32]);
+
+impl PayloadAttemptId {
+    /// Reconstructs an identity from authenticated layout metadata.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the exact bytes used by the segment nonce and associated data.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// Result alias for type validation.
 pub type Result<T> = std::result::Result<T, TypeError>;
@@ -151,6 +198,12 @@ impl fmt::Display for BackendObjectId {
     }
 }
 
+impl Borrow<str> for BackendObjectId {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
 /// Opaque provider version identifier for a backend object.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BackendVersionId(Arc<str>);
@@ -224,28 +277,6 @@ impl ManifestId {
 }
 
 impl fmt::Display for ManifestId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-/// Identifier for a signed checkpoint.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct CheckpointId(String);
-
-impl CheckpointId {
-    /// Creates a validated checkpoint identifier.
-    pub fn new(value: impl Into<String>) -> Result<Self> {
-        validate_non_empty("checkpoint id", value.into()).map(Self)
-    }
-
-    /// Returns the identifier as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for CheckpointId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
@@ -340,22 +371,13 @@ pub struct KeyDescriptor {
     pub id: KeyId,
     /// Cryptographic purpose of the key.
     pub purpose: KeyPurpose,
-    /// Algorithm or provider-specific suite identifier.
-    pub algorithm: String,
     /// Key lifecycle state.
     pub status: KeyStatus,
     /// Creation timestamp in milliseconds since the Unix epoch.
     pub created_at_ms: i64,
-    /// Optional lower validity bound in milliseconds since the Unix epoch.
-    pub not_before_ms: Option<i64>,
-    /// Optional upper validity bound in milliseconds since the Unix epoch.
-    pub not_after_ms: Option<i64>,
     /// Optional hex-encoded public verification key for asymmetric keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
-    /// Optional external KMS key URI when material is provider-managed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_kms_uri: Option<String>,
 }
 
 /// Monotonic checkpoint sequence.

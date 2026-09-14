@@ -107,27 +107,28 @@ where
         }
 
         let chunk = if self.pending.is_empty() {
-            match self.source.next_source_chunk().await {
-                Ok(Some(chunk)) if chunk.is_empty() => {
-                    self.terminal = true;
-                    return Err(invalid_stream_length(
-                        "blob read returned an empty body chunk",
-                    ));
-                }
-                Ok(Some(chunk)) => chunk,
-                Ok(None) if self.remaining == 0 => {
-                    self.terminal = true;
-                    return Ok(None);
-                }
-                Ok(None) => {
-                    self.terminal = true;
-                    return Err(invalid_stream_length(
-                        "blob read ended before its exact length",
-                    ));
-                }
-                Err(error) => {
-                    self.terminal = true;
-                    return Err(error);
+            loop {
+                match self.source.next_source_chunk().await {
+                    Ok(Some(chunk)) if chunk.is_empty() => {
+                        // Empty transport frames are not EOF. Yield so a stream of
+                        // immediately-ready empty frames cannot starve cancellation.
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(Some(chunk)) => break chunk,
+                    Ok(None) if self.remaining == 0 => {
+                        self.terminal = true;
+                        return Ok(None);
+                    }
+                    Ok(None) => {
+                        self.terminal = true;
+                        return Err(invalid_stream_length(
+                            "blob read ended before its exact length",
+                        ));
+                    }
+                    Err(error) => {
+                        self.terminal = true;
+                        return Err(error);
+                    }
                 }
             }
         } else {
@@ -268,13 +269,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_reader_rejects_empty_nonterminal_chunks() {
-        let mut read = scripted([Ok(Some(Bytes::new())), Ok(None)], 0);
-
-        assert!(matches!(
+    async fn exact_reader_skips_empty_chunks_but_still_requires_exact_eof() {
+        let mut read = scripted(
+            [
+                Ok(Some(Bytes::new())),
+                Ok(Some(Bytes::from_static(b"abc"))),
+                Ok(Some(Bytes::new())),
+                Ok(None),
+            ],
+            3,
+        );
+        assert_eq!(
             read.next_chunk().await,
-            Err(StorageError::Provider(message)) if message.contains("empty body chunk")
-        ));
+            Ok(Some(Bytes::from_static(b"abc")))
+        );
+        assert_eq!(read.next_chunk().await, Ok(None));
+        let mut truncated = scripted([Ok(Some(Bytes::new())), Ok(None)], 1);
+        assert!(matches!(truncated.next_chunk().await,
+            Err(StorageError::Provider(message)) if message.contains("before its exact length")));
+        let mut overlong = scripted(
+            [Ok(Some(Bytes::new())), Ok(Some(Bytes::from_static(b"x")))],
+            0,
+        );
+        assert!(matches!(overlong.next_chunk().await,
+            Err(StorageError::Provider(message)) if message.contains("exceeded its exact length")));
     }
 
     #[tokio::test]

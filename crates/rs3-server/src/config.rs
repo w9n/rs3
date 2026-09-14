@@ -2,8 +2,8 @@
 
 use crate::identity::StaticCredentials;
 use rs3_crypto::{MIN_REPOSITORY_SALT_LEN, SecretBytes, ct_eq, validate_recovery_public_key};
-use rs3_repository::v2::{DEFAULT_RETENTION_RENEWAL_HORIZON, V2MaintenanceBudgets};
-use rs3_repository::{DEFAULT_PAYLOAD_SEGMENT_SIZE, v2::DEFAULT_V2_STREAM_READ_STALL_TIMEOUT};
+use rs3_repository::v3::{DEFAULT_RETENTION_RENEWAL_HORIZON, RecoveryPolicy, V3MaintenanceBudgets};
+use rs3_repository::{DEFAULT_PAYLOAD_SEGMENT_SIZE, v3::DEFAULT_V3_STREAM_READ_STALL_TIMEOUT};
 use rs3_types::{BackendObjectId, PublicBucket, RepositoryId, RetentionMode, RetentionPolicy};
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
@@ -51,6 +51,9 @@ const PROVIDER_CONFORMANCE_REPORT_FILE_ENV: &str = "RS3_PROVIDER_CONFORMANCE_REP
 const PROVIDER_CONFORMANCE_MAX_AGE_SECONDS_ENV: &str = "RS3_PROVIDER_CONFORMANCE_MAX_AGE_SECONDS";
 const PROVIDER_PRINCIPAL_FINGERPRINT_ENV: &str = "RS3_PROVIDER_PRINCIPAL_FINGERPRINT";
 pub(crate) const RECOVERY_PUBLIC_KEY_ENV: &str = "RS3_RECOVERY_PUBLIC_KEY";
+const RECOVERY_WINDOW_DAYS_ENV: &str = "RS3_RECOVERY_WINDOW_DAYS";
+const RECOVERY_RENEWAL_MARGIN_SECONDS_ENV: &str = "RS3_RECOVERY_RENEWAL_MARGIN_SECONDS";
+const RECOVERY_CLOCK_UNCERTAINTY_MS_ENV: &str = "RS3_RECOVERY_CLOCK_UNCERTAINTY_MS";
 
 pub(crate) const REPOSITORY_SALT_HEX_ENV: &str = "RS3_REPOSITORY_SALT_HEX";
 pub(crate) const KEYRING_ENVELOPE_OBJECT_ID_ENV: &str = "RS3_KEYRING_ENVELOPE_OBJECT_ID";
@@ -60,6 +63,7 @@ const REPOSITORY_ID_ENV: &str = "RS3_REPOSITORY_ID";
 const ALLOW_MEMORY_ANCHOR_ENV: &str = "RS3_ALLOW_MEMORY_ANCHOR";
 const WRITER_GUARD_ENV: &str = "RS3_WRITER_GUARD";
 const MAINTENANCE_MODE_ENV: &str = "RS3_MAINTENANCE_MODE";
+const RECLAMATION_ENABLED_ENV: &str = "RS3_RECLAMATION_ENABLED";
 const MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV: &str = "RS3_MAINTENANCE_RENEWAL_HORIZON_SECONDS";
 const MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV: &str = "RS3_MAINTENANCE_ORPHAN_PRESSURE_BYTES";
 const MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV: &str = "RS3_MAINTENANCE_ORPHAN_PRESSURE_COUNT";
@@ -70,11 +74,18 @@ const MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV: &str = "RS3_MAINTENANCE_MIN_COOLDOWN
 const MAINTENANCE_PACING_DELAY_MS_ENV: &str = "RS3_MAINTENANCE_PACING_DELAY_MS";
 const MAINTENANCE_MAX_INVENTORY_PAGES_ENV: &str = "RS3_MAINTENANCE_MAX_INVENTORY_PAGES";
 const MAINTENANCE_MAX_INVENTORY_ITEMS_ENV: &str = "RS3_MAINTENANCE_MAX_INVENTORY_ITEMS";
+const MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV: &str =
+    "RS3_MAINTENANCE_MAX_HISTORY_METADATA_BYTES";
+const MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV: &str = "RS3_MAINTENANCE_MAX_HISTORY_PENDING_BYTES";
 const DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_COUNT: u64 = 512;
 const DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_MAX_AGE_SECONDS: u64 = 48 * 60 * 60;
 const DEFAULT_MAINTENANCE_MAX_INTERVAL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_MAINTENANCE_MIN_COOLDOWN_SECONDS: u64 = 60 * 60;
+const MIN_MAINTENANCE_HISTORY_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_MAINTENANCE_HISTORY_METADATA_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MIN_MAINTENANCE_HISTORY_PENDING_BYTES: u64 = 24 * 1024 * 1024;
+const MAX_MAINTENANCE_HISTORY_PENDING_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Complete runtime configuration for the gateway process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,9 +122,9 @@ pub struct RuntimeConfig {
     pub static_credentials: Option<StaticCredentials>,
 }
 
-/// Minimal configuration needed to probe v2 provider behavior.
+/// Minimal configuration needed to probe v3 provider behavior.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V2ProviderCheckConfig {
+pub struct V3ProviderCheckConfig {
     /// Backend object-store settings.
     pub backend: BackendConfig,
     /// Durable repository format selected for the provider check.
@@ -144,15 +155,17 @@ pub struct RepositoryToolConfig {
 pub struct RepositoryKeyContextConfig {
     /// Stable repository derivation context.
     pub repository_id: RepositoryId,
-    /// Stable public salt used with the repository ID when opening envelopes.
-    pub repository_salt_hex: String,
+    /// Optional operator-pinned public salt. When unset, initialization
+    /// generates one and every later opener recovers it from the verified
+    /// envelope; when set, it must equal the envelope's salt.
+    pub repository_salt_hex: Option<String>,
     /// Optional bootstrap or recovery override for an encrypted keyring envelope object.
     pub envelope_object_id: Option<BackendObjectId>,
     /// Operator-visible wrapping key identifier.
     pub wrapping_key_id: String,
 }
 
-impl From<&RuntimeConfig> for V2ProviderCheckConfig {
+impl From<&RuntimeConfig> for V3ProviderCheckConfig {
     fn from(config: &RuntimeConfig) -> Self {
         Self {
             backend: config.backend.clone(),
@@ -246,6 +259,15 @@ pub struct BackendConfig {
     pub timeouts: BackendTimeoutConfig,
 }
 
+impl BackendConfig {
+    /// Whether this endpoint selects the S3 adapter.
+    pub fn is_s3(&self) -> bool {
+        matches!(self.endpoint.as_str(), "s3" | "s3://" | "s3://aws")
+            || self.endpoint.starts_with("https://")
+            || self.endpoint.starts_with("http://")
+    }
+}
+
 /// Provider-neutral timeout policy for backend operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackendTimeoutConfig {
@@ -311,7 +333,7 @@ impl Default for HardeningConfig {
             max_put_object_bytes: DEFAULT_MAX_PUT_OBJECT_BYTES,
             buffered_put_object_bytes: DEFAULT_BUFFERED_PUT_OBJECT_BYTES,
             backend_multipart_part_bytes: DEFAULT_BACKEND_MULTIPART_PART_BYTES,
-            stream_read_stall_timeout: DEFAULT_V2_STREAM_READ_STALL_TIMEOUT,
+            stream_read_stall_timeout: DEFAULT_V3_STREAM_READ_STALL_TIMEOUT,
             max_in_flight_upload_body_bytes: DEFAULT_MAX_IN_FLIGHT_UPLOAD_BODY_BYTES,
             max_in_flight_download_body_bytes: DEFAULT_MAX_IN_FLIGHT_DOWNLOAD_BODY_BYTES,
             max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
@@ -326,7 +348,7 @@ impl Default for HardeningConfig {
 pub enum AnchorConfig {
     /// In-process anchor for local development and tests.
     Memory,
-    /// Kubernetes Lease object used as the monotonic v2 commit anchor.
+    /// Kubernetes Lease object used as the monotonic v3 commit anchor.
     KubernetesLease {
         /// Kubernetes namespace containing the Lease.
         namespace: String,
@@ -392,6 +414,10 @@ impl MaintenanceMode {
 pub struct MaintenanceConfig {
     /// Supervisor posture. Forced off for restore-readonly gateways.
     pub mode: MaintenanceMode,
+    /// Whether completed maintenance plans may delete unreachable backend versions.
+    ///
+    /// Disabling reclamation does not disable protection renewal.
+    pub reclamation_enabled: bool,
     /// Lead time before the nearest provider retain-until deadline.
     pub renewal_horizon: Duration,
     /// Orphan bytes at which a full-maintenance run becomes due.
@@ -410,13 +436,18 @@ pub struct MaintenanceConfig {
     pub max_inventory_pages: u64,
     /// Maximum raw provider members consumed while building maintenance inventory.
     pub max_inventory_items: u64,
+    /// Maximum authenticated recovery-history metadata bytes accounted by one plan.
+    pub max_history_metadata_bytes: u64,
+    /// Maximum encoded section buffers and read scratch during history traversal.
+    pub max_history_pending_bytes: u64,
 }
 
 impl Default for MaintenanceConfig {
     fn default() -> Self {
-        let budget_defaults = V2MaintenanceBudgets::default();
+        let budget_defaults = V3MaintenanceBudgets::default();
         Self {
             mode: MaintenanceMode::Auto,
+            reclamation_enabled: true,
             renewal_horizon: DEFAULT_RETENTION_RENEWAL_HORIZON,
             orphan_pressure_bytes: DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_BYTES,
             orphan_pressure_count: DEFAULT_MAINTENANCE_ORPHAN_PRESSURE_COUNT,
@@ -428,6 +459,8 @@ impl Default for MaintenanceConfig {
             pacing_delay: None,
             max_inventory_pages: budget_defaults.max_inventory_page_count,
             max_inventory_items: budget_defaults.max_inventory_item_count,
+            max_history_metadata_bytes: budget_defaults.max_history_metadata_bytes,
+            max_history_pending_bytes: budget_defaults.max_history_pending_bytes,
         }
     }
 }
@@ -437,17 +470,20 @@ impl MaintenanceConfig {
     pub fn forced_off() -> Self {
         Self {
             mode: MaintenanceMode::Off,
+            reclamation_enabled: false,
             ..Self::default()
         }
     }
 
     /// Returns maintenance I/O budgets derived from these settings.
-    pub fn budgets(&self) -> V2MaintenanceBudgets {
-        V2MaintenanceBudgets {
+    pub fn budgets(&self) -> V3MaintenanceBudgets {
+        V3MaintenanceBudgets {
             max_inventory_page_count: self.max_inventory_pages,
             max_inventory_item_count: self.max_inventory_items,
+            max_history_metadata_bytes: self.max_history_metadata_bytes,
+            max_history_pending_bytes: self.max_history_pending_bytes,
             op_pacing_delay: self.pacing_delay,
-            ..V2MaintenanceBudgets::default()
+            ..V3MaintenanceBudgets::default()
         }
     }
 }
@@ -455,7 +491,7 @@ impl MaintenanceConfig {
 /// Provider-conformance evidence settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderConformanceConfig {
-    /// Optional JSON report emitted by `rs3 check-v2-provider`.
+    /// Optional JSON report emitted by `rs3 check-provider`.
     pub report_file: Option<PathBuf>,
     /// Maximum accepted report age before status marks the evidence stale.
     pub max_age: Duration,
@@ -464,10 +500,21 @@ pub struct ProviderConformanceConfig {
 }
 
 /// Disaster-recovery trust settings.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryConfig {
     /// Operator-controlled public key used to verify recovery bundle signatures.
     pub public_key: Option<String>,
+    /// Validated recovery-history promise policy.
+    pub policy: RecoveryPolicy,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            public_key: None,
+            policy: RecoveryPolicy::PRESET,
+        }
+    }
 }
 
 impl Default for ProviderConformanceConfig {
@@ -484,14 +531,14 @@ impl Default for ProviderConformanceConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepositoryFormat {
     /// Production-preview format for new repositories.
-    V2Preview,
+    V3Preview,
 }
 
 impl RepositoryFormat {
     /// Returns the environment/configuration spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::V2Preview => "v2-preview",
+            Self::V3Preview => "v3-preview",
         }
     }
 }
@@ -501,8 +548,8 @@ impl RepositoryFormat {
 pub struct RepositoryKeysConfig {
     /// Stable repository derivation context.
     pub repository_id: RepositoryId,
-    /// Stable public salt used with the repository ID when opening the envelope.
-    pub repository_salt_hex: String,
+    /// Optional operator-pinned public salt; see [`RepositoryKeyContextConfig`].
+    pub repository_salt_hex: Option<String>,
     /// Optional bootstrap or recovery override for the encrypted keyring envelope.
     pub envelope_object_id: Option<BackendObjectId>,
     /// Operator-visible wrapping key identifier.
@@ -516,7 +563,13 @@ impl fmt::Debug for RepositoryKeysConfig {
         formatter
             .debug_struct("RepositoryKeysConfig")
             .field("repository_id", &"<configured>")
-            .field("repository_salt_hex", &"<configured>")
+            .field(
+                "repository_salt_hex",
+                &self
+                    .repository_salt_hex
+                    .as_ref()
+                    .map_or("<recovered-from-envelope>", |_| "<configured>"),
+            )
             .field("envelope_object_id", &"<configured>")
             .field("wrapping_key_id", &"<configured>")
             .field("wrapping_key_hex", &REDACTED_SECRET_VALUE)
@@ -599,6 +652,14 @@ impl RuntimeConfig {
         Self::from_source(&ProcessEnv)
     }
 
+    /// Loads the environment using an explicit CLI mode before parsing maintenance.
+    ///
+    /// Read-write overrides preserve configured maintenance settings. An explicit
+    /// restore-readonly override forces maintenance off regardless of those settings.
+    pub fn from_env_with_mode_override(mode: Option<GatewayMode>) -> Result<Self, ConfigError> {
+        Self::from_source_with_mode_override(&ProcessEnv, mode)
+    }
+
     /// Validates invariants required by every runtime construction path.
     ///
     /// This must be called for programmatically assembled configurations as
@@ -611,7 +672,7 @@ impl RuntimeConfig {
         validate_runtime_hardening(&mut errors, &self.hardening);
         validate_runtime_batching(&mut errors, &self.batching);
         validate_runtime_repository(&mut errors, &self.repository);
-        validate_runtime_maintenance(&mut errors, self.mode, &self.maintenance);
+        validate_runtime_maintenance(&mut errors, self.mode, &self.repository, &self.maintenance);
         validate_runtime_provider_conformance(&mut errors, &self.provider_conformance);
         validate_runtime_writer_guard(&mut errors, &self.anchor, self.writer_guard);
         validate_runtime_repository_keys(&mut errors, &self.repository_keys);
@@ -627,8 +688,18 @@ impl RuntimeConfig {
     }
 
     fn from_source(source: &impl ConfigSource) -> Result<Self, ConfigError> {
+        Self::from_source_with_mode_override(source, None)
+    }
+
+    fn from_source_with_mode_override(
+        source: &impl ConfigSource,
+        mode_override: Option<GatewayMode>,
+    ) -> Result<Self, ConfigError> {
         let mut errors = Vec::new();
-        let mode = collect_config_error(&mut errors, parse_gateway_mode(source));
+        let mode = collect_config_error(
+            &mut errors,
+            mode_override.map_or_else(|| parse_gateway_mode(source), Ok),
+        );
         let bind = collect_config_error(
             &mut errors,
             parse_socket_addr(
@@ -660,7 +731,11 @@ impl RuntimeConfig {
         let repository = collect_config_error(&mut errors, parse_repository_config(source));
         let maintenance = collect_config_error(
             &mut errors,
-            parse_maintenance_config(source, mode.unwrap_or(GatewayMode::ReadWrite)),
+            if mode_override == Some(GatewayMode::RestoreReadOnly) {
+                Ok(MaintenanceConfig::forced_off())
+            } else {
+                parse_maintenance_config(source, mode.unwrap_or(GatewayMode::ReadWrite))
+            },
         );
         let provider_conformance =
             collect_config_error(&mut errors, parse_provider_conformance_config(source));
@@ -696,8 +771,8 @@ impl RuntimeConfig {
     }
 }
 
-impl V2ProviderCheckConfig {
-    /// Loads v2 provider check configuration from the current process environment.
+impl V3ProviderCheckConfig {
+    /// Loads v3 provider check configuration from the current process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_source(&ProcessEnv)
     }
@@ -970,7 +1045,7 @@ fn parse_hardening_config(source: &impl ConfigSource) -> Result<HardeningConfig,
         parse_positive_u64(
             "RS3_STREAM_READ_STALL_TIMEOUT_SECS",
             source.value("RS3_STREAM_READ_STALL_TIMEOUT_SECS"),
-            DEFAULT_V2_STREAM_READ_STALL_TIMEOUT.as_secs(),
+            DEFAULT_V3_STREAM_READ_STALL_TIMEOUT.as_secs(),
         ),
     )
     .map(Duration::from_secs);
@@ -1314,6 +1389,7 @@ fn validate_runtime_repository(errors: &mut Vec<ConfigError>, repository: &Repos
 fn validate_runtime_maintenance(
     errors: &mut Vec<ConfigError>,
     mode: GatewayMode,
+    repository: &RepositoryConfig,
     maintenance: &MaintenanceConfig,
 ) {
     if mode == GatewayMode::RestoreReadOnly && maintenance.mode != MaintenanceMode::Off {
@@ -1322,6 +1398,17 @@ fn validate_runtime_maintenance(
             MAINTENANCE_MODE_ENV,
             maintenance.mode.as_str(),
             "restore-readonly gateways require maintenance to be off",
+        );
+    }
+    if mode == GatewayMode::ReadWrite
+        && repository.retention.is_some()
+        && maintenance.mode != MaintenanceMode::Auto
+    {
+        push_runtime_invalid(
+            errors,
+            MAINTENANCE_MODE_ENV,
+            maintenance.mode.as_str(),
+            "retained repositories require auto maintenance for protection renewal; set RS3_RECLAMATION_ENABLED=false to disable physical deletion",
         );
     }
     for (key, value) in [
@@ -1481,8 +1568,8 @@ fn validate_runtime_writer_guard(
 }
 
 fn validate_runtime_repository_keys(errors: &mut Vec<ConfigError>, keys: &RepositoryKeysConfig) {
-    if let Err(error) =
-        validate_repository_salt_hex(REPOSITORY_SALT_HEX_ENV, &keys.repository_salt_hex)
+    if let Some(salt_hex) = keys.repository_salt_hex.as_deref()
+        && let Err(error) = validate_repository_salt_hex(REPOSITORY_SALT_HEX_ENV, salt_hex)
     {
         errors.push(error);
     }
@@ -1554,7 +1641,7 @@ pub(crate) fn configured_streaming_upload_working_set_bytes(
         repository.payload_segment_size,
         repository.adaptive_payload_segment_size,
     );
-    rs3_repository::v2::v2_streaming_upload_working_set_bytes(
+    rs3_repository::v3::v3_streaming_upload_working_set_bytes(
         hardening.backend_multipart_part_bytes,
         u64::try_from(payload_segment_bytes).unwrap_or(u64::MAX),
     )
@@ -1775,6 +1862,14 @@ fn parse_maintenance_config(
 
     let mut errors = Vec::new();
     let defaults = MaintenanceConfig::default();
+    let reclamation_enabled = collect_config_error(
+        &mut errors,
+        parse_bool(
+            RECLAMATION_ENABLED_ENV,
+            source.value(RECLAMATION_ENABLED_ENV),
+            defaults.reclamation_enabled,
+        ),
+    );
     let renewal_horizon = collect_config_error(
         &mut errors,
         parse_positive_u64(
@@ -1851,6 +1946,26 @@ fn parse_maintenance_config(
             defaults.max_inventory_items,
         ),
     );
+    let max_history_metadata_bytes = collect_config_error(
+        &mut errors,
+        parse_bounded_u64(
+            MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+            source.value(MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV),
+            defaults.max_history_metadata_bytes,
+            MIN_MAINTENANCE_HISTORY_METADATA_BYTES,
+            MAX_MAINTENANCE_HISTORY_METADATA_BYTES,
+        ),
+    );
+    let max_history_pending_bytes = collect_config_error(
+        &mut errors,
+        parse_bounded_u64(
+            MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV,
+            source.value(MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV),
+            defaults.max_history_pending_bytes,
+            MIN_MAINTENANCE_HISTORY_PENDING_BYTES,
+            MAX_MAINTENANCE_HISTORY_PENDING_BYTES,
+        ),
+    );
     if let (Some(min_cooldown), Some(max_interval)) = (min_cooldown, max_interval)
         && min_cooldown > max_interval
     {
@@ -1867,6 +1982,7 @@ fn parse_maintenance_config(
 
     Ok(MaintenanceConfig {
         mode: maintenance_mode,
+        reclamation_enabled: require_collected_config(reclamation_enabled)?,
         renewal_horizon: require_collected_config(renewal_horizon)?,
         orphan_pressure_bytes: require_collected_config(orphan_pressure_bytes)?,
         orphan_pressure_count: require_collected_config(orphan_pressure_count)?,
@@ -1876,6 +1992,8 @@ fn parse_maintenance_config(
         pacing_delay: require_collected_config(pacing_delay)?,
         max_inventory_pages: require_collected_config(max_inventory_pages)?,
         max_inventory_items: require_collected_config(max_inventory_items)?,
+        max_history_metadata_bytes: require_collected_config(max_history_metadata_bytes)?,
+        max_history_pending_bytes: require_collected_config(max_history_pending_bytes)?,
     })
 }
 
@@ -1928,19 +2046,52 @@ fn parse_recovery_config(source: &impl ConfigSource) -> Result<RecoveryConfig, C
             Ok(value)
         })
         .transpose()?;
-    Ok(RecoveryConfig { public_key })
+    let defaults = RecoveryPolicy::PRESET;
+    let window_days = parse_positive_u32_with_default(
+        RECOVERY_WINDOW_DAYS_ENV,
+        source.value(RECOVERY_WINDOW_DAYS_ENV),
+        defaults.window_days(),
+    )?;
+    let renewal_margin_seconds = parse_positive_u32_with_default(
+        RECOVERY_RENEWAL_MARGIN_SECONDS_ENV,
+        source.value(RECOVERY_RENEWAL_MARGIN_SECONDS_ENV),
+        defaults.renewal_margin_seconds(),
+    )?;
+    let clock_uncertainty_ms = parse_positive_u32_with_default(
+        RECOVERY_CLOCK_UNCERTAINTY_MS_ENV,
+        source.value(RECOVERY_CLOCK_UNCERTAINTY_MS_ENV),
+        defaults.clock_uncertainty_ms(),
+    )?;
+    let policy = RecoveryPolicy::new(window_days, renewal_margin_seconds, clock_uncertainty_ms)
+        .map_err(|error| ConfigError::Invalid {
+            key: RECOVERY_RENEWAL_MARGIN_SECONDS_ENV,
+            value: renewal_margin_seconds.to_string(),
+            reason: error.to_string(),
+        })?;
+    Ok(RecoveryConfig { public_key, policy })
+}
+
+fn parse_positive_u32_with_default(
+    key: &'static str,
+    value: Option<String>,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match value {
+        Some(value) => parse_positive_u32(key, Some(value), String::new()),
+        None => Ok(default),
+    }
 }
 
 fn parse_repository_format(source: &impl ConfigSource) -> Result<RepositoryFormat, ConfigError> {
     match optional_value(source, REPOSITORY_FORMAT_ENV) {
-        None => Ok(RepositoryFormat::V2Preview),
-        Some(value) if value == RepositoryFormat::V2Preview.as_str() => {
-            Ok(RepositoryFormat::V2Preview)
+        None => Ok(RepositoryFormat::V3Preview),
+        Some(value) if value == RepositoryFormat::V3Preview.as_str() => {
+            Ok(RepositoryFormat::V3Preview)
         }
         Some(value) => Err(ConfigError::Invalid {
             key: REPOSITORY_FORMAT_ENV,
             value,
-            reason: "omit this compatibility variable or set v2-preview".to_owned(),
+            reason: "omit this compatibility variable or set v3-preview".to_owned(),
         }),
     }
 }
@@ -2015,7 +2166,7 @@ fn parse_repository_key_context_config(
         .unwrap_or(None);
     let repository_salt_hex = collect_config_error(
         &mut errors,
-        required_repository_salt_hex(source, REPOSITORY_SALT_HEX_ENV),
+        optional_repository_salt_hex(source, REPOSITORY_SALT_HEX_ENV),
     );
     let envelope_object_id = match optional_value(source, KEYRING_ENVELOPE_OBJECT_ID_ENV) {
         Some(value) => collect_config_error(
@@ -2058,13 +2209,15 @@ fn parse_backend_object_id(
     })
 }
 
-fn required_repository_salt_hex(
+fn optional_repository_salt_hex(
     source: &impl ConfigSource,
     key: &'static str,
-) -> Result<String, ConfigError> {
-    let value = required_value(source, key)?;
+) -> Result<Option<String>, ConfigError> {
+    let Some(value) = optional_value(source, key) else {
+        return Ok(None);
+    };
     validate_repository_salt_hex(key, &value)?;
-    Ok(value)
+    Ok(Some(value))
 }
 
 fn required_secret_hex(
@@ -2276,6 +2429,26 @@ fn parse_positive_u64(
     Ok(parsed)
 }
 
+fn parse_bounded_u64(
+    key: &'static str,
+    value: Option<String>,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, ConfigError> {
+    let reported_value = value.clone().unwrap_or_else(|| default.to_string());
+    let parsed = parse_u64(key, value, default)?;
+    if !(minimum..=maximum).contains(&parsed) {
+        return Err(ConfigError::Invalid {
+            key,
+            value: reported_value,
+            reason: format!("expected whole bytes from {minimum} through {maximum}"),
+        });
+    }
+
+    Ok(parsed)
+}
+
 fn parse_bool(
     key: &'static str,
     value: Option<String>,
@@ -2309,7 +2482,7 @@ mod tests {
         AnchorConfig, BatchConfig, ConfigError, ConfigSource, GatewayMode, HardeningConfig,
         MaintenanceConfig, MetricsConfig, RecoveryConfig, RepositoryConfig, RepositoryFormat,
         RepositoryKeyContextConfig, RepositoryKeysConfig, RepositoryToolConfig, RuntimeConfig,
-        StaticCredentials, V2ProviderCheckConfig, WriterGuardConfig,
+        StaticCredentials, V3ProviderCheckConfig, WriterGuardConfig,
     };
     use rs3_types::{RetentionMode, RetentionPolicy};
     use secrecy::SecretString;
@@ -2359,7 +2532,7 @@ mod tests {
         RepositoryKeysConfig {
             repository_id: rs3_types::RepositoryId::new("test-repository")
                 .unwrap_or_else(|error| panic!("{error}")),
-            repository_salt_hex: REPOSITORY_SALT_HEX.to_owned(),
+            repository_salt_hex: Some(REPOSITORY_SALT_HEX.to_owned()),
             envelope_object_id: None,
             wrapping_key_id: super::DEFAULT_KEYRING_WRAPPING_KEY_ID.to_owned(),
             wrapping_key_hex: SecretString::from(WRAPPING_KEY_HEX),
@@ -2405,7 +2578,7 @@ mod tests {
         assert_eq!(
             config.repository,
             RepositoryConfig {
-                format: RepositoryFormat::V2Preview,
+                format: RepositoryFormat::V3Preview,
                 payload_segment_size: 512,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -2433,12 +2606,12 @@ mod tests {
             .with(super::REPOSITORY_RETENTION_DAYS_ENV, "7");
 
         let config =
-            V2ProviderCheckConfig::from_source(&source).unwrap_or_else(|error| panic!("{error}"));
+            V3ProviderCheckConfig::from_source(&source).unwrap_or_else(|error| panic!("{error}"));
 
         assert_eq!(config.backend.endpoint, "https://object.example");
         assert_eq!(config.backend.bucket, "backend-bucket");
         assert_eq!(config.backend.prefix.as_deref(), Some("provider-check"));
-        assert_eq!(config.repository_format, RepositoryFormat::V2Preview);
+        assert_eq!(config.repository_format, RepositoryFormat::V3Preview);
         assert_eq!(
             config.repository_retention,
             Some(RetentionPolicy::new(RetentionMode::Governance, 7))
@@ -2447,7 +2620,7 @@ mod tests {
 
     #[test]
     fn provider_check_config_still_requires_backend() {
-        let error = V2ProviderCheckConfig::from_source(&TestSource::default())
+        let error = V3ProviderCheckConfig::from_source(&TestSource::default())
             .expect_err("provider check needs a backend to probe");
 
         assert_eq!(
@@ -2466,7 +2639,7 @@ mod tests {
             .with(super::REPOSITORY_SALT_HEX_ENV, REPOSITORY_SALT_HEX)
             .with(
                 super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
-                "keyrings/bootstrap-envelope.json",
+                "keyrings/bootstrap-envelope.cbor",
             )
             .with(super::KEYRING_WRAPPING_KEY_ID_ENV, "wrap-custom")
             .with(super::REPOSITORY_RETENTION_MODE_ENV, "compliance")
@@ -2482,7 +2655,7 @@ mod tests {
         assert_eq!(config.backend.endpoint, "https://object.example");
         assert_eq!(config.backend.bucket, "backend-bucket");
         assert_eq!(config.backend.prefix.as_deref(), Some("repository"));
-        assert_eq!(config.repository_format, RepositoryFormat::V2Preview);
+        assert_eq!(config.repository_format, RepositoryFormat::V3Preview);
         assert_eq!(
             config.repository_retention,
             Some(RetentionPolicy::new(RetentionMode::Compliance, 30))
@@ -2496,9 +2669,9 @@ mod tests {
             RepositoryKeyContextConfig {
                 repository_id: rs3_types::RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),
-                repository_salt_hex: REPOSITORY_SALT_HEX.to_owned(),
+                repository_salt_hex: Some(REPOSITORY_SALT_HEX.to_owned()),
                 envelope_object_id: Some(
-                    rs3_types::BackendObjectId::new("keyrings/bootstrap-envelope.json")
+                    rs3_types::BackendObjectId::new("keyrings/bootstrap-envelope.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),
                 ),
                 wrapping_key_id: "wrap-custom".to_owned(),
@@ -2517,20 +2690,19 @@ mod tests {
                 "RS3_BACKEND_ENDPOINT",
                 "RS3_BACKEND_BUCKET",
                 super::REPOSITORY_ID_ENV,
-                super::REPOSITORY_SALT_HEX_ENV,
             ]
         );
     }
 
     #[test]
-    fn accepts_legacy_repository_format_v2_preview() {
-        let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v2-preview");
+    fn accepts_current_repository_format_v3_preview() {
+        let source = minimal_source().with(super::REPOSITORY_FORMAT_ENV, "v3-preview");
 
         let config = RuntimeConfig::from_source(&source);
 
         assert_eq!(
             config.map(|config| config.repository.format),
-            Ok(RepositoryFormat::V2Preview)
+            Ok(RepositoryFormat::V3Preview)
         );
     }
 
@@ -2846,7 +3018,7 @@ mod tests {
         assert_eq!(
             config.map(|config| config.repository),
             Ok(RepositoryConfig {
-                format: RepositoryFormat::V2Preview,
+                format: RepositoryFormat::V3Preview,
                 payload_segment_size: 65536,
                 adaptive_payload_segment_size: false,
                 decrypted_segment_cache_max_bytes:
@@ -2916,6 +3088,7 @@ mod tests {
         };
         assert_eq!(maintenance, MaintenanceConfig::default());
         assert_eq!(maintenance.mode, super::MaintenanceMode::Auto);
+        assert!(maintenance.reclamation_enabled);
         assert_eq!(
             maintenance.renewal_horizon,
             Duration::from_secs(7 * 24 * 60 * 60)
@@ -2932,15 +3105,75 @@ mod tests {
         );
         assert_eq!(maintenance.min_cooldown, Duration::from_secs(60 * 60));
         assert_eq!(maintenance.pacing_delay, None);
+        assert_eq!(maintenance.max_history_metadata_bytes, 256 * 1024 * 1024);
+        assert_eq!(maintenance.max_history_pending_bytes, 64 * 1024 * 1024);
         let budgets = maintenance.budgets();
         assert_eq!(budgets.op_pacing_delay, None);
         assert_eq!(
             budgets.max_inventory_page_count,
-            rs3_repository::v2::V2MaintenanceBudgets::default().max_inventory_page_count
+            rs3_repository::v3::V3MaintenanceBudgets::default().max_inventory_page_count
         );
         assert_eq!(
             budgets.max_inventory_item_count,
-            rs3_repository::v2::V2MaintenanceBudgets::default().max_inventory_item_count
+            rs3_repository::v3::V3MaintenanceBudgets::default().max_inventory_item_count
+        );
+        assert_eq!(budgets.max_history_metadata_bytes, 256 * 1024 * 1024);
+        assert_eq!(budgets.max_history_pending_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn read_write_mode_override_preserves_maintenance_environment() {
+        for maintenance_mode in ["auto", "manual", "off"] {
+            let source = minimal_source()
+                .with("RS3_GATEWAY_MODE", "restore-readonly")
+                .with(super::MAINTENANCE_MODE_ENV, maintenance_mode)
+                .with(super::MAINTENANCE_MAX_INTERVAL_SECONDS_ENV, "86400")
+                .with(super::MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV, "19");
+            let expected =
+                RuntimeConfig::from_source(&source.clone().with("RS3_GATEWAY_MODE", "read-write"))
+                    .expect("equivalent read-write environment");
+            let actual = RuntimeConfig::from_source_with_mode_override(
+                &source,
+                Some(GatewayMode::ReadWrite),
+            )
+            .expect("read-write CLI override");
+            assert_eq!(actual.mode, GatewayMode::ReadWrite);
+            assert_eq!(actual.maintenance, expected.maintenance);
+            assert_eq!(actual.maintenance.max_interval, Duration::from_secs(86400));
+            assert_eq!(actual.maintenance.orphan_pressure_count, 19);
+        }
+    }
+
+    #[test]
+    fn read_write_mode_override_validates_previously_inactive_settings() {
+        let source = minimal_source()
+            .with("RS3_GATEWAY_MODE", "restore-readonly")
+            .with(super::MAINTENANCE_MAX_INTERVAL_SECONDS_ENV, "invalid");
+        assert!(RuntimeConfig::from_source(&source).is_ok());
+        let error =
+            RuntimeConfig::from_source_with_mode_override(&source, Some(GatewayMode::ReadWrite))
+                .expect_err("invalid active interval must reject");
+        assert!(
+            error
+                .to_string()
+                .contains(super::MAINTENANCE_MAX_INTERVAL_SECONDS_ENV)
+        );
+    }
+
+    #[test]
+    fn explicit_readonly_override_forces_maintenance_off() {
+        let source = minimal_source().with(super::MAINTENANCE_MODE_ENV, "manual");
+        let actual = RuntimeConfig::from_source_with_mode_override(
+            &source,
+            Some(GatewayMode::RestoreReadOnly),
+        )
+        .expect("readonly override");
+        assert_eq!(actual.mode, GatewayMode::RestoreReadOnly);
+        assert_eq!(actual.maintenance, MaintenanceConfig::forced_off());
+        // Environment-only readonly configuration retains its strict validation.
+        assert!(
+            RuntimeConfig::from_source(&source.with("RS3_GATEWAY_MODE", "restore-readonly"))
+                .is_err()
         );
     }
 
@@ -2948,6 +3181,7 @@ mod tests {
     fn parses_maintenance_overrides() {
         let source = minimal_source()
             .with(super::MAINTENANCE_MODE_ENV, "manual")
+            .with(super::RECLAMATION_ENABLED_ENV, "false")
             .with(super::MAINTENANCE_RENEWAL_HORIZON_SECONDS_ENV, "86400")
             .with(super::MAINTENANCE_ORPHAN_PRESSURE_BYTES_ENV, "1048576")
             .with(super::MAINTENANCE_ORPHAN_PRESSURE_COUNT_ENV, "9")
@@ -2959,7 +3193,12 @@ mod tests {
             .with(super::MAINTENANCE_MIN_COOLDOWN_SECONDS_ENV, "600")
             .with(super::MAINTENANCE_PACING_DELAY_MS_ENV, "25")
             .with(super::MAINTENANCE_MAX_INVENTORY_PAGES_ENV, "128")
-            .with(super::MAINTENANCE_MAX_INVENTORY_ITEMS_ENV, "4096");
+            .with(super::MAINTENANCE_MAX_INVENTORY_ITEMS_ENV, "4096")
+            .with(
+                super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+                "1073741824",
+            )
+            .with(super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV, "25165824");
 
         let config = RuntimeConfig::from_source(&source);
 
@@ -2968,6 +3207,7 @@ mod tests {
             Err(error) => panic!("{error}"),
         };
         assert_eq!(maintenance.mode, super::MaintenanceMode::Manual);
+        assert!(!maintenance.reclamation_enabled);
         assert_eq!(maintenance.renewal_horizon, Duration::from_secs(86_400));
         assert_eq!(maintenance.orphan_pressure_bytes, 1_048_576);
         assert_eq!(maintenance.orphan_pressure_count, 9);
@@ -2980,21 +3220,27 @@ mod tests {
         assert_eq!(maintenance.pacing_delay, Some(Duration::from_millis(25)));
         assert_eq!(maintenance.max_inventory_pages, 128);
         assert_eq!(maintenance.max_inventory_items, 4_096);
+        assert_eq!(maintenance.max_history_metadata_bytes, 1_073_741_824);
+        assert_eq!(maintenance.max_history_pending_bytes, 25_165_824);
         let budgets = maintenance.budgets();
         assert_eq!(budgets.op_pacing_delay, Some(Duration::from_millis(25)));
         assert_eq!(budgets.max_inventory_page_count, 128);
         assert_eq!(budgets.max_inventory_item_count, 4_096);
+        assert_eq!(budgets.max_history_metadata_bytes, 1_073_741_824);
+        assert_eq!(budgets.max_history_pending_bytes, 25_165_824);
     }
 
     #[test]
-    fn rejects_invalid_maintenance_mode() {
-        let source = minimal_source().with(super::MAINTENANCE_MODE_ENV, "always");
-
-        let config = RuntimeConfig::from_source(&source);
-
-        assert!(
-            matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::MAINTENANCE_MODE_ENV)
-        );
+    fn rejects_invalid_maintenance_mode_or_reclamation_switch() {
+        for (key, value) in [
+            (super::MAINTENANCE_MODE_ENV, "always"),
+            (super::RECLAMATION_ENABLED_ENV, "sometimes"),
+        ] {
+            let config = RuntimeConfig::from_source(&minimal_source().with(key, value));
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key)
+            );
+        }
     }
 
     #[test]
@@ -3009,6 +3255,8 @@ mod tests {
             super::MAINTENANCE_PACING_DELAY_MS_ENV,
             super::MAINTENANCE_MAX_INVENTORY_PAGES_ENV,
             super::MAINTENANCE_MAX_INVENTORY_ITEMS_ENV,
+            super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+            super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV,
         ] {
             let source = minimal_source().with(key, "0");
 
@@ -3017,6 +3265,50 @@ mod tests {
             assert!(
                 matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key),
                 "expected zero rejection for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_maintenance_history_budgets() {
+        let bounds = RuntimeConfig::from_source(
+            &minimal_source()
+                .with(
+                    super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+                    "8589934592",
+                )
+                .with(
+                    super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV,
+                    "1073741824",
+                ),
+        )
+        .expect("maximum history budgets must be accepted");
+        assert_eq!(
+            bounds.maintenance.max_history_metadata_bytes,
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            bounds.maintenance.max_history_pending_bytes,
+            1024 * 1024 * 1024
+        );
+
+        for (key, value) in [
+            (super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV, "1048575"),
+            (
+                super::MAINTENANCE_MAX_HISTORY_METADATA_BYTES_ENV,
+                "8589934593",
+            ),
+            (super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV, "25165823"),
+            (
+                super::MAINTENANCE_MAX_HISTORY_PENDING_BYTES_ENV,
+                "1073741825",
+            ),
+        ] {
+            let config = RuntimeConfig::from_source(&minimal_source().with(key, value));
+
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key),
+                "expected {key}={value} rejection"
             );
         }
     }
@@ -3035,8 +3327,27 @@ mod tests {
     }
 
     #[test]
+    fn retained_read_write_rejects_manual_or_off_maintenance() {
+        for value in ["manual", "off"] {
+            let source = minimal_source()
+                .with(super::REPOSITORY_RETENTION_MODE_ENV, "governance")
+                .with(super::REPOSITORY_RETENTION_DAYS_ENV, "30")
+                .with(super::MAINTENANCE_MODE_ENV, value);
+
+            let config = RuntimeConfig::from_source(&source);
+
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key, .. }) if key == super::MAINTENANCE_MODE_ENV),
+                "expected retained RS3_MAINTENANCE_MODE={value} rejection"
+            );
+        }
+    }
+
+    #[test]
     fn forces_maintenance_off_for_restore_readonly() {
-        let source = minimal_source().with("RS3_GATEWAY_MODE", "restore-readonly");
+        let source = minimal_source()
+            .with("RS3_GATEWAY_MODE", "restore-readonly")
+            .with(super::RECLAMATION_ENABLED_ENV, "true");
 
         let config = RuntimeConfig::from_source(&source);
 
@@ -3045,6 +3356,7 @@ mod tests {
             Err(error) => panic!("{error}"),
         };
         assert_eq!(maintenance.mode, super::MaintenanceMode::Off);
+        assert!(!maintenance.reclamation_enabled);
     }
 
     #[test]
@@ -3102,6 +3414,44 @@ mod tests {
 
         assert!(config_error_keys(&error).contains(&super::PROVIDER_PRINCIPAL_FINGERPRINT_ENV));
         assert!(!error.to_string().contains("tenant-a"));
+    }
+
+    #[test]
+    fn parses_recovery_policy_overrides() {
+        let source = minimal_source()
+            .with(super::RECOVERY_WINDOW_DAYS_ENV, "45")
+            .with(super::RECOVERY_RENEWAL_MARGIN_SECONDS_ENV, "90000")
+            .with(super::RECOVERY_CLOCK_UNCERTAINTY_MS_ENV, "1000");
+
+        let config = RuntimeConfig::from_source(&source).expect("valid recovery policy");
+        assert_eq!(config.recovery.policy.window_days(), 45);
+        assert_eq!(config.recovery.policy.renewal_margin_seconds(), 90_000);
+        assert_eq!(config.recovery.policy.clock_uncertainty_ms(), 1_000);
+    }
+
+    #[test]
+    fn rejects_invalid_recovery_policy_values() {
+        for (key, value) in [
+            (super::RECOVERY_WINDOW_DAYS_ENV, "0"),
+            (super::RECOVERY_RENEWAL_MARGIN_SECONDS_ENV, "0"),
+            (super::RECOVERY_CLOCK_UNCERTAINTY_MS_ENV, "0"),
+            (super::RECOVERY_WINDOW_DAYS_ENV, "4294967296"),
+        ] {
+            let config = RuntimeConfig::from_source(&minimal_source().with(key, value));
+            assert!(
+                matches!(config, Err(ConfigError::Invalid { key: invalid_key, .. }) if invalid_key == key),
+                "expected recovery policy rejection for {key}={value}"
+            );
+        }
+        let config = RuntimeConfig::from_source(
+            &minimal_source()
+                .with(super::RECOVERY_RENEWAL_MARGIN_SECONDS_ENV, "60")
+                .with(super::RECOVERY_CLOCK_UNCERTAINTY_MS_ENV, "60000"),
+        );
+        assert!(matches!(
+            config,
+            Err(ConfigError::Invalid { key, .. }) if key == super::RECOVERY_RENEWAL_MARGIN_SECONDS_ENV
+        ));
     }
 
     #[test]
@@ -3167,7 +3517,7 @@ mod tests {
         let source = minimal_source()
             .with(
                 super::KEYRING_ENVELOPE_OBJECT_ID_ENV,
-                "keyrings/bootstrap-envelope.json",
+                "keyrings/bootstrap-envelope.cbor",
             )
             .with(super::KEYRING_WRAPPING_KEY_ID_ENV, "wrap-custom");
 
@@ -3179,7 +3529,7 @@ mod tests {
         };
         assert_eq!(
             keys.envelope_object_id.as_ref().map(|id| id.as_str()),
-            Some("keyrings/bootstrap-envelope.json")
+            Some("keyrings/bootstrap-envelope.cbor")
         );
         assert_eq!(keys.wrapping_key_id, "wrap-custom");
     }
@@ -3206,14 +3556,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_repository_salt() {
+    fn accepts_a_missing_repository_salt_for_envelope_recovery() {
         let source = minimal_source().without(super::REPOSITORY_SALT_HEX_ENV);
 
-        let config = RuntimeConfig::from_source(&source);
+        let config = RuntimeConfig::from_source(&source).expect("salt is optional");
 
-        assert!(
-            matches!(config, Err(ConfigError::Missing { key }) if key == super::REPOSITORY_SALT_HEX_ENV)
-        );
+        assert_eq!(config.repository_keys.repository_salt_hex, None);
+        assert!(format!("{:?}", config.repository_keys).contains("<recovered-from-envelope>"));
     }
 
     #[test]

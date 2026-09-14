@@ -1,4 +1,3 @@
-use super::S3BlobStore;
 use super::errors::{
     backend_version_id_from_str, map_sdk_common_error, map_sdk_put_error, provider_error,
 };
@@ -9,6 +8,7 @@ use super::object_lock::{
     sdk_object_lock_mode, sdk_object_lock_retention_mode, sdk_retention_extension_date,
     verify_legal_hold, verify_retention, verify_retention_extension,
 };
+use super::{LimitMetadataResponseBody, S3BlobStore};
 use crate::{BlobMetadata, PutOptions, Result, StorageError};
 use aws_sdk_s3::primitives::ByteStream as SdkByteStream;
 use aws_sdk_s3::types::{
@@ -36,10 +36,12 @@ impl S3BlobStore {
         let versioning = client
             .get_bucket_versioning()
             .bucket(self.config.bucket.as_str())
+            .customize()
+            .interceptor(LimitMetadataResponseBody)
             .send()
             .await
-            .map_err(|error| {
-                StorageError::Provider(format!("failed to read S3 bucket versioning: {error}"))
+            .map_err(|_| {
+                StorageError::Provider("failed to read S3 bucket versioning".to_owned())
             })?;
         if versioning
             .status()
@@ -53,12 +55,12 @@ impl S3BlobStore {
         let object_lock = client
             .get_object_lock_configuration()
             .bucket(self.config.bucket.as_str())
+            .customize()
+            .interceptor(LimitMetadataResponseBody)
             .send()
             .await
-            .map_err(|error| {
-                StorageError::Provider(format!(
-                    "failed to read S3 Object Lock configuration: {error}"
-                ))
+            .map_err(|_| {
+                StorageError::Provider("failed to read S3 Object Lock configuration".to_owned())
             })?;
         let object_lock_enabled = object_lock
             .object_lock_configuration()
@@ -115,7 +117,15 @@ impl S3BlobStore {
             request = request.content_type(content_type);
         }
 
+        // An ambiguous retained PUT may already have created a protected
+        // version. Let the publication caller reconcile it before reserving
+        // another attempt, even if the SDK client has automatic retries set.
         let output = request
+            .customize()
+            .config_override(
+                aws_sdk_s3::config::Builder::new()
+                    .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled()),
+            )
             .send()
             .await
             .map_err(|error| map_sdk_put_error(error, object_id))?;

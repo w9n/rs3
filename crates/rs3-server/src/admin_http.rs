@@ -1148,7 +1148,7 @@ mod tests {
                 max_pending_items: 64,
             },
             repository: RepositoryConfig {
-                format: RepositoryFormat::V2Preview,
+                format: RepositoryFormat::V3Preview,
                 payload_segment_size: rs3_repository::DEFAULT_PAYLOAD_SEGMENT_SIZE,
                 adaptive_payload_segment_size: true,
                 decrypted_segment_cache_max_bytes:
@@ -1162,10 +1162,11 @@ mod tests {
             repository_keys: RepositoryKeysConfig {
                 repository_id: RepositoryId::new("test-repository")
                     .unwrap_or_else(|error| panic!("{error}")),
-                repository_salt_hex:
+                repository_salt_hex: Some(
                     "2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+                ),
                 envelope_object_id: Some(
-                    BackendObjectId::new("keyrings/test-envelope.json")
+                    BackendObjectId::new("keyrings/test-envelope.cbor")
                         .unwrap_or_else(|error| panic!("{error}")),
                 ),
                 wrapping_key_id: "wrap-v1".to_owned(),
@@ -1460,10 +1461,10 @@ mod tests {
         use http::{Method, Request, StatusCode};
         use http_body_util::Full;
         use rs3_repository::RepositoryError;
-        use rs3_repository::v2::{
-            V2FullGcApplyOptions, V2FullGcApplyReport, V2FullGcDryRunOptions, V2FullGcDryRunReport,
-            V2FullGcPlanPreview, V2FullMaintenanceReport, V2MaintenanceCancellation,
-            V2MaintenancePlanCost, V2MaintenanceReport, V2OrphanGcOptions, V2OrphanGcReport,
+        use rs3_repository::v3::{
+            V3FullGcApplyOptions, V3FullGcApplyReport, V3FullGcDryRunOptions, V3FullGcDryRunReport,
+            V3FullGcPlanPreview, V3FullMaintenanceReport, V3MaintenanceCancellation,
+            V3MaintenancePlanCost, V3MaintenanceReport, V3OrphanGcOptions, V3OrphanGcReport,
         };
         use serde_json::Value;
         use std::sync::{Arc, Mutex as StdMutex};
@@ -1478,8 +1479,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{error}"))
         }
 
-        fn dry_run_report() -> V2FullGcDryRunReport {
-            V2FullGcDryRunReport {
+        fn dry_run_report() -> V3FullGcDryRunReport {
+            V3FullGcDryRunReport {
                 base_sequence: None,
                 chain_live_commit_count: 1,
                 protected_root_count: 0,
@@ -1497,14 +1498,14 @@ mod tests {
                 retention_renewal_bytes: 64,
                 retention_renewal_blocked_count: 0,
                 retention_renewal_blocked_bytes: 0,
-                planned_cost: V2MaintenancePlanCost::default(),
+                planned_cost: V3MaintenancePlanCost::default(),
                 fits_budgets: true,
                 exact_version_apply_ready: true,
             }
         }
 
-        fn quick_report() -> V2MaintenanceReport {
-            V2MaintenanceReport {
+        fn quick_report() -> V3MaintenanceReport {
+            V3MaintenanceReport {
                 anchor_present: true,
                 verified_commit_count: 1,
                 last_anchored_commit_age_ms: Some(0),
@@ -1514,16 +1515,23 @@ mod tests {
                 oldest_orphan_age_ms: None,
                 reclaimable_orphan_candidate_count: 0,
                 reclaimable_orphan_candidate_bytes: 0,
+                packed_payload_stored_bytes: 0,
+                packed_payload_referenced_bytes: 0,
                 oldest_reclaimable_orphan_age_ms: None,
                 retention_renewal_commit_count: 0,
                 retention_renewal_bytes: 0,
                 retention_renewal_blocked_count: 0,
                 retention_renewal_blocked_bytes: 0,
                 nearest_retain_until_ms: None,
+                recovery_expiry_due_ms: None,
+                recovery_recoverable_point_count: 0,
+                recovery_oldest_recoverable_publish_time_ms: None,
+                recovery_historical_exact_bytes: 0,
+                recovery_clock_uncertainty_ms: None,
             }
         }
 
-        fn mock_plan_digest(report: &V2FullGcDryRunReport) -> String {
+        fn mock_plan_digest(report: &V3FullGcDryRunReport) -> String {
             rs3_crypto::derive_public_fingerprint(
                 b"rs3.admin-http.mock-plan.v1",
                 &[&report.dead_bytes_reclaimable.to_be_bytes()],
@@ -1532,7 +1540,7 @@ mod tests {
 
         struct StaticMaintenanceRuntime {
             guard_configured: bool,
-            dry_run: StdMutex<V2FullGcDryRunReport>,
+            dry_run: StdMutex<V3FullGcDryRunReport>,
         }
 
         impl StaticMaintenanceRuntime {
@@ -1557,23 +1565,23 @@ mod tests {
 
             async fn quick_maintenance_report(
                 &self,
-            ) -> Result<V2MaintenanceReport, RepositoryError> {
+            ) -> Result<V3MaintenanceReport, RepositoryError> {
                 Ok(quick_report())
             }
 
             async fn full_gc_dry_run(
                 &self,
-                _options: V2FullGcDryRunOptions,
-            ) -> Result<V2FullGcDryRunReport, RepositoryError> {
+                _options: V3FullGcDryRunOptions,
+            ) -> Result<V3FullGcDryRunReport, RepositoryError> {
                 Ok(self.dry_run.lock().expect("mock dry-run lock").clone())
             }
 
             async fn preview_full_gc_plan(
                 &self,
-                _options: V2FullGcApplyOptions,
-            ) -> Result<V2FullGcPlanPreview, RepositoryError> {
+                _options: V3FullGcApplyOptions,
+            ) -> Result<V3FullGcPlanPreview, RepositoryError> {
                 let report = self.dry_run.lock().expect("mock dry-run lock").clone();
-                Ok(V2FullGcPlanPreview {
+                Ok(V3FullGcPlanPreview {
                     plan_digest: mock_plan_digest(&report),
                     report,
                 })
@@ -1581,11 +1589,11 @@ mod tests {
 
             async fn run_full_maintenance(
                 &self,
-                _options: V2FullGcApplyOptions,
+                _options: V3FullGcApplyOptions,
                 expected_plan_digest: Option<&str>,
-                _cancellation: &V2MaintenanceCancellation,
+                _cancellation: &V3MaintenanceCancellation,
                 on_phase: &(dyn Fn(MaintenanceRunPhase) + Send + Sync),
-            ) -> Result<V2FullMaintenanceReport, RepositoryError> {
+            ) -> Result<V3FullMaintenanceReport, RepositoryError> {
                 on_phase(MaintenanceRunPhase::Quiescing);
                 let fresh = self.dry_run.lock().expect("mock dry-run lock").clone();
                 if let Some(expected) = expected_plan_digest
@@ -1596,16 +1604,16 @@ mod tests {
                     });
                 }
                 on_phase(MaintenanceRunPhase::Applying);
-                Ok(V2FullMaintenanceReport {
+                Ok(V3FullMaintenanceReport {
                     dry_run: fresh.clone(),
-                    apply: V2FullGcApplyReport {
+                    apply: V3FullGcApplyReport {
                         dry_run: fresh,
                         retention_renewed_object_count: 1,
                         retention_renewed_bytes: 64,
-                        orphan_gc: V2OrphanGcReport {
+                        orphan_gc: V3OrphanGcReport {
                             scanned_count: 1,
                             deleted_count: 1,
-                            ..V2OrphanGcReport::default()
+                            ..V3OrphanGcReport::default()
                         },
                     },
                 })
@@ -1620,7 +1628,7 @@ mod tests {
                         ..MaintenanceConfig::default()
                     },
                     retention_configured: false,
-                    orphan_gc: V2OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
+                    orphan_gc: V3OrphanGcOptions::new_for_test_rehearsal(Duration::ZERO),
                     retained_provider_conformance: Arc::new(|| true),
                 },
                 runtime,
